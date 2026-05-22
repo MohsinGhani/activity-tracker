@@ -11,7 +11,10 @@
     "dist:linux": "electron-builder --linux --publish always"
   },
   "keywords": [],
-  "author": "Mohsin Ghani",
+  "author": {
+    "name": "Mohsin Ghani",
+    "email": "mohsinghani.777@gmail.com"
+  },
   "license": "ISC",
   "dependencies": {
     "dotenv": "^16.0.0",
