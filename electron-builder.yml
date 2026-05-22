@@ -17,6 +17,7 @@ files:
   - styles.css
   - firebase.js
   - cloudinary.js
+  - config.js
   - assets/**
   - package.json
   - node_modules/**
