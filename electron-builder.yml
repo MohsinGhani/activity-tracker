@@ -1,6 +1,11 @@
 appId: com.incitertech.activitytracker
 productName: Activity Tracker
 
+publish:
+  provider: github
+  owner: MohsinGhani
+  repo: activity-tracker
+
 directories:
   output: release
 
