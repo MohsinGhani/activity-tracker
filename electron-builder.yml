@@ -1,0 +1,45 @@
+appId: com.incitertech.activitytracker
+productName: Activity Tracker
+
+directories:
+  output: release
+
+files:
+  - main.js
+  - preload.js
+  - index.html
+  - renderer.js
+  - styles.css
+  - firebase.js
+  - cloudinary.js
+  - assets/**
+  - package.json
+  - node_modules/**
+
+asar: true
+
+win:
+  target:
+    - nsis
+  icon: assets/icon.ico
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+
+mac:
+  target:
+    - dmg
+    - zip
+  icon: assets/icon.icns
+  hardenedRuntime: true
+
+linux:
+  target:
+    - AppImage
+    - deb
+  icon: assets/icon.png
+  category: Utility
