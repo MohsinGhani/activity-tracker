@@ -4,7 +4,6 @@ const { contextBridge, ipcRenderer } = require("electron");
 
 contextBridge.exposeInMainWorld("tracker", {
   takeScreenshot: () => ipcRenderer.invoke("take-screenshot"),
-  getEnvConfig: () => ipcRenderer.invoke("get-env-config"),
   getIdleState: () => ipcRenderer.invoke("get-idle-state"),
   storeGet: (key) => ipcRenderer.invoke("store-get", key),
   storeSet: (key, value) => ipcRenderer.invoke("store-set", key, value),
