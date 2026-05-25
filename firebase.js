@@ -45,15 +45,16 @@ export async function saveScreenshot(sessionId, userId, imageUrl, timestamp) {
 export async function createSession(userId) {
   const docRef = await addDoc(collection(db, "sessions"), {
     userId,
-    startTime: serverTimestamp(),
+    startTime: new Date(),
     status: "active",
   });
   return docRef.id;
 }
 
-export async function endSession(sessionId, duration) {
+export async function endSession(sessionId, duration, endTime, startTime) {
   return updateDoc(doc(db, "sessions", sessionId), {
-    endTime: serverTimestamp(),
+    startTime,
+    endTime,
     duration,
     status: "ended",
   });

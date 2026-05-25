@@ -149,10 +149,16 @@ async function endCurrentSession() {
   if (!currentSessionId) return;
 
   const duration = Math.floor(getElapsedMs() / 1000);
+  const endTime = new Date();
   clearTimers();
 
   try {
-    await endSession(currentSessionId, duration);
+    await endSession(
+      currentSessionId,
+      duration,
+      endTime,
+      getEffectiveSessionStartDate(endTime.getTime()),
+    );
   } catch (err) {
     console.error("Failed to end session in Firestore:", err);
   }
@@ -210,6 +216,10 @@ function getElapsedMs() {
   return elapsedBeforePauseMs + (Date.now() - sessionStartTime);
 }
 
+function getEffectiveSessionStartDate(referenceMs = Date.now()) {
+  return new Date(referenceMs - getElapsedMs());
+}
+
 function pad(n) {
   return String(n).padStart(2, "0");
 }
@@ -224,19 +234,12 @@ function startIdlePoll() {
     const state = await window.tracker.getIdleState();
     if ((state === "idle" || state === "locked") && !isIdle) {
       isIdle = true;
-      clearInterval(timerInterval);
-      timerInterval = null;
-      clearTimeout(screenshotTimeout);
-      screenshotTimeout = null;
+      await pauseSession();
       statusText.textContent = "Session paused (idle)";
-      statusText.className = "status-text";
       showToast("Session paused — you are idle.");
     } else if (state === "active" && isIdle) {
       isIdle = false;
-      startTimer();
-      scheduleNextScreenshot();
-      statusText.textContent = "Session active";
-      statusText.className = "status-text active";
+      await resumeSession();
       showToast("Session resumed.");
     }
   }, 30000);
