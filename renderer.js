@@ -11,10 +11,12 @@ import { uploadScreenshot } from "./cloudinary.js";
 let currentUser = null;
 let currentSessionId = null;
 let sessionStartTime = null;
+let elapsedBeforePauseMs = 0;
 let timerInterval = null;
 let screenshotTimeout = null;
 let isIdle = false;
 let idlePollInterval = null;
+let isSessionPaused = false;
 
 const loginView = document.getElementById("login-view");
 const dashView = document.getElementById("dashboard-view");
@@ -26,6 +28,7 @@ const welcomeMsg = document.getElementById("welcome-msg");
 const timerDisplay = document.getElementById("timer-display");
 const startBtn = document.getElementById("start-btn");
 const stopBtn = document.getElementById("stop-btn");
+const endBtn = document.getElementById("end-btn");
 const statusText = document.getElementById("status-text");
 const toastArea = document.getElementById("toast-area");
 const logoutBtn = document.getElementById("logout-btn");
@@ -71,7 +74,7 @@ async function handleLogin() {
 }
 
 logoutBtn.addEventListener("click", async () => {
-  if (currentSessionId) await stopSession();
+  if (currentSessionId) await endCurrentSession();
   await logoutUser();
 });
 
@@ -83,10 +86,14 @@ startBtn.addEventListener("click", async () => {
     const sessionId = await createSession(currentUser.uid);
     currentSessionId = sessionId;
     sessionStartTime = Date.now();
+    elapsedBeforePauseMs = 0;
+    isSessionPaused = false;
 
     await window.tracker.storeSet("sessionId", sessionId);
     await window.tracker.storeSet("sessionStartTime", sessionStartTime);
     await window.tracker.storeSet("sessionUserId", currentUser.uid);
+    await window.tracker.storeSet("sessionElapsedMs", elapsedBeforePauseMs);
+    await window.tracker.storeSet("sessionPaused", false);
 
     startTimer();
     scheduleNextScreenshot();
@@ -100,12 +107,48 @@ startBtn.addEventListener("click", async () => {
   }
 });
 
-stopBtn.addEventListener("click", stopSession);
+stopBtn.addEventListener("click", toggleSessionState);
+endBtn.addEventListener("click", endCurrentSession);
 
-async function stopSession() {
+async function toggleSessionState() {
   if (!currentSessionId) return;
 
-  const duration = Math.floor((Date.now() - sessionStartTime) / 1000);
+  if (isSessionPaused) {
+    await resumeSession();
+    return;
+  }
+
+  await pauseSession();
+}
+
+async function pauseSession() {
+  elapsedBeforePauseMs = getElapsedMs();
+  sessionStartTime = null;
+  clearInterval(timerInterval);
+  timerInterval = null;
+  clearTimeout(screenshotTimeout);
+  screenshotTimeout = null;
+  stopIdlePoll();
+  isSessionPaused = true;
+  renderTimer();
+  await persistSessionState();
+  setPausedUI();
+}
+
+async function resumeSession() {
+  sessionStartTime = Date.now();
+  isSessionPaused = false;
+  await persistSessionState();
+  startTimer();
+  scheduleNextScreenshot();
+  startIdlePoll();
+  setActiveUI();
+}
+
+async function endCurrentSession() {
+  if (!currentSessionId) return;
+
+  const duration = Math.floor(getElapsedMs() / 1000);
   clearTimers();
 
   try {
@@ -123,10 +166,23 @@ async function restoreSession() {
   const sessionId = await window.tracker.storeGet("sessionId");
   const startTime = await window.tracker.storeGet("sessionStartTime");
   const userId = await window.tracker.storeGet("sessionUserId");
+  const elapsedMs = Number(
+    (await window.tracker.storeGet("sessionElapsedMs")) ?? 0,
+  );
+  const paused = Boolean(await window.tracker.storeGet("sessionPaused"));
 
-  if (sessionId && startTime && userId === currentUser.uid) {
+  if (sessionId && userId === currentUser.uid) {
     currentSessionId = sessionId;
-    sessionStartTime = Number(startTime);
+    elapsedBeforePauseMs = elapsedMs;
+    isSessionPaused = paused;
+    sessionStartTime = paused ? null : Number(startTime);
+
+    if (isSessionPaused) {
+      renderTimer();
+      setPausedUI();
+      return;
+    }
+
     startTimer();
     scheduleNextScreenshot();
     startIdlePoll();
@@ -141,11 +197,17 @@ function startTimer() {
 }
 
 function renderTimer() {
-  const secs = Math.max(0, Math.floor((Date.now() - sessionStartTime) / 1000));
+  const secs = Math.max(0, Math.floor(getElapsedMs() / 1000));
   const h = Math.floor(secs / 3600);
   const m = Math.floor((secs % 3600) / 60);
   const s = secs % 60;
   timerDisplay.textContent = `${pad(h)}h ${pad(m)}m ${pad(s)}s`;
+}
+
+function getElapsedMs() {
+  if (!currentSessionId) return 0;
+  if (!sessionStartTime) return elapsedBeforePauseMs;
+  return elapsedBeforePauseMs + (Date.now() - sessionStartTime);
 }
 
 function pad(n) {
@@ -279,7 +341,26 @@ function setActiveUI() {
   statusText.textContent = "Session active";
   statusText.className = "status-text active";
   startBtn.style.display = "none";
+  stopBtn.style.display = "";
+  endBtn.style.display = "";
   stopBtn.disabled = false;
+  stopBtn.classList.remove("btn-success");
+  stopBtn.classList.add("btn-danger");
+  stopBtn.innerHTML = "&#10074;&#10074; Pause Session";
+  endBtn.disabled = false;
+}
+
+function setPausedUI() {
+  statusText.textContent = "Session paused";
+  statusText.className = "status-text";
+  startBtn.style.display = "none";
+  stopBtn.style.display = "";
+  endBtn.style.display = "";
+  stopBtn.disabled = false;
+  stopBtn.classList.remove("btn-danger");
+  stopBtn.classList.add("btn-success");
+  stopBtn.innerHTML = "&#9654; Resume Session";
+  endBtn.disabled = false;
 }
 
 function setInactiveUI() {
@@ -289,7 +370,13 @@ function setInactiveUI() {
   startBtn.style.display = "";
   startBtn.disabled = false;
   startBtn.textContent = "\u25B6 Start Session";
+  stopBtn.style.display = "none";
+  endBtn.style.display = "none";
   stopBtn.disabled = true;
+  stopBtn.classList.remove("btn-success");
+  stopBtn.classList.add("btn-danger");
+  stopBtn.innerHTML = "&#10074;&#10074; Pause Session";
+  endBtn.disabled = true;
 }
 
 function showToast(message) {
@@ -318,13 +405,23 @@ function clearTimers() {
 function clearSessionState() {
   currentSessionId = null;
   sessionStartTime = null;
+  elapsedBeforePauseMs = 0;
   isIdle = false;
+  isSessionPaused = false;
 }
 
 async function clearStoredSession() {
   await window.tracker.storeSet("sessionId", null);
   await window.tracker.storeSet("sessionStartTime", null);
   await window.tracker.storeSet("sessionUserId", null);
+  await window.tracker.storeSet("sessionElapsedMs", null);
+  await window.tracker.storeSet("sessionPaused", null);
+}
+
+async function persistSessionState() {
+  await window.tracker.storeSet("sessionStartTime", sessionStartTime);
+  await window.tracker.storeSet("sessionElapsedMs", elapsedBeforePauseMs);
+  await window.tracker.storeSet("sessionPaused", isSessionPaused);
 }
 
 function friendlyAuthError(err) {

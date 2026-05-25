@@ -224,6 +224,21 @@ body {
   background: var(--danger-hover);
 }
 
+.btn-danger-outline {
+  width: 100%;
+  padding: 12px;
+  background: transparent;
+  color: var(--danger);
+  border: 1px solid rgba(228, 59, 0, 0.55);
+  font-size: 15px;
+}
+
+.btn-danger-outline:hover:not(:disabled) {
+  background: rgba(228, 59, 0, 0.12);
+  border-color: var(--danger);
+  color: #fff;
+}
+
 .btn-ghost {
   padding: 6px 14px;
   background: transparent;
