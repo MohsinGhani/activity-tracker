@@ -32,14 +32,26 @@ export function onAuthChange(callback) {
   return onAuthStateChanged(auth, callback);
 }
 
-export async function saveScreenshot(sessionId, userId, imageUrl, timestamp) {
-  return addDoc(collection(db, "screenshots"), {
+export async function saveScreenshot(
+  sessionId,
+  userId,
+  imageUrl,
+  timestamp,
+  activitySummary = null,
+) {
+  const screenshotDoc = {
     sessionId,
     userId,
     imageUrl,
     timestamp,
     createdAt: serverTimestamp(),
-  });
+  };
+
+  if (activitySummary) {
+    screenshotDoc.activitySummary = activitySummary;
+  }
+
+  return addDoc(collection(db, "screenshots"), screenshotDoc);
 }
 
 export async function createSession(userId) {

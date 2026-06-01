@@ -17,6 +17,8 @@ let screenshotTimeout = null;
 let isIdle = false;
 let idlePollInterval = null;
 let isSessionPaused = false;
+let pausedDueToIdle = false;
+let idleResumeInProgress = false;
 
 const loginView = document.getElementById("login-view");
 const dashView = document.getElementById("dashboard-view");
@@ -121,15 +123,21 @@ async function toggleSessionState() {
   await pauseSession();
 }
 
-async function pauseSession() {
+async function pauseSession(dueToIdle = false) {
   elapsedBeforePauseMs = getElapsedMs();
   sessionStartTime = null;
   clearInterval(timerInterval);
   timerInterval = null;
   clearTimeout(screenshotTimeout);
   screenshotTimeout = null;
-  stopIdlePoll();
+  if (!dueToIdle) {
+    stopIdlePoll();
+  }
   isSessionPaused = true;
+  pausedDueToIdle = dueToIdle;
+  if (dueToIdle) {
+    isIdle = true;
+  }
   renderTimer();
   await persistSessionState();
   setPausedUI();
@@ -138,6 +146,8 @@ async function pauseSession() {
 async function resumeSession() {
   sessionStartTime = Date.now();
   isSessionPaused = false;
+  pausedDueToIdle = false;
+  isIdle = false;
   await persistSessionState();
   startTimer();
   scheduleNextScreenshot();
@@ -224,23 +234,36 @@ function pad(n) {
   return String(n).padStart(2, "0");
 }
 
-const MIN_MS = 15 * 60 * 1000;
-const MAX_MS = 15 * 60 * 1000;
+const MIN_SCREENSHOT_DELAY_MS = 8 * 60 * 1000;
+const MAX_SCREENSHOT_DELAY_MS = 10 * 60 * 1000;
 
 function startIdlePoll() {
   stopIdlePoll();
   idlePollInterval = setInterval(async () => {
     if (!currentSessionId) return;
     const state = await window.tracker.getIdleState();
-    if ((state === "idle" || state === "locked") && !isIdle) {
+    if (
+      (state === "idle" || state === "locked") &&
+      !isIdle &&
+      !isSessionPaused
+    ) {
       isIdle = true;
-      await pauseSession();
+      await pauseSession(true);
       statusText.textContent = "Session paused (idle)";
       showToast("Session paused — you are idle.");
-    } else if (state === "active" && isIdle) {
-      isIdle = false;
-      await resumeSession();
-      showToast("Session resumed.");
+    } else if (
+      state === "active" &&
+      isSessionPaused &&
+      pausedDueToIdle &&
+      !idleResumeInProgress
+    ) {
+      idleResumeInProgress = true;
+      try {
+        await resumeSession();
+        showToast("Session resumed.");
+      } finally {
+        idleResumeInProgress = false;
+      }
     }
   }, 30000);
 }
@@ -253,7 +276,15 @@ function stopIdlePoll() {
 
 function scheduleNextScreenshot() {
   if (screenshotTimeout) clearTimeout(screenshotTimeout);
-  const delay = MIN_MS + Math.floor(Math.random() * (MAX_MS - MIN_MS + 1));
+  if (isSessionPaused) {
+    screenshotTimeout = null;
+    return;
+  }
+  const delay =
+    MIN_SCREENSHOT_DELAY_MS +
+    Math.floor(
+      Math.random() * (MAX_SCREENSHOT_DELAY_MS - MIN_SCREENSHOT_DELAY_MS + 1),
+    );
   screenshotTimeout = setTimeout(captureAndUpload, delay);
 }
 
@@ -292,10 +323,17 @@ async function stitchScreenshots(dataUrls) {
 }
 
 async function captureAndUpload() {
-  if (!currentSessionId || !currentUser) return;
+  if (!currentSessionId || !currentUser || isSessionPaused) return;
 
   try {
-    const dataUrls = await window.tracker.takeScreenshot();
+    const captureResult = await window.tracker.takeScreenshot();
+    const dataUrls = Array.isArray(captureResult)
+      ? captureResult
+      : captureResult?.dataUrls;
+    const activitySummary = Array.isArray(captureResult)
+      ? null
+      : (captureResult?.activitySummary ?? null);
+
     const stitched = await stitchScreenshots(dataUrls);
     const imageUrl = await uploadScreenshot(stitched);
     const now = new Date();
@@ -305,6 +343,7 @@ async function captureAndUpload() {
       currentUser.uid,
       imageUrl,
       now.toISOString(),
+      activitySummary,
     );
 
     const timeStr = now.toLocaleTimeString("en-US", {
@@ -312,11 +351,12 @@ async function captureAndUpload() {
       minute: "2-digit",
       hour12: true,
     });
+    const activitySuffix = activitySummary ? ` - ${activitySummary}` : "";
 
-    showToast(`Screenshot captured at ${timeStr}`);
+    showToast(`Screenshot captured at ${timeStr}${activitySuffix}`);
     await window.tracker.showNotification(
       "Team Tracker",
-      `Screenshot captured at ${timeStr}`,
+      `Screenshot captured at ${timeStr}${activitySuffix}`,
     );
   } catch (err) {
     console.error("Screenshot capture/upload failed:", err);
@@ -411,6 +451,8 @@ function clearSessionState() {
   elapsedBeforePauseMs = 0;
   isIdle = false;
   isSessionPaused = false;
+  pausedDueToIdle = false;
+  idleResumeInProgress = false;
 }
 
 async function clearStoredSession() {
