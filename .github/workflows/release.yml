@@ -31,7 +31,7 @@ jobs:
             uploadPreset: "nuxt_unsigned",
           };
           "@ | Set-Content config.js
-      - run: npm install
+      - run: npm ci
       - run: npm run dist:win
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
@@ -61,7 +61,7 @@ jobs:
             uploadPreset: "nuxt_unsigned",
           };
           EOF
-      - run: npm install
+      - run: npm ci
       - run: npm run dist:mac
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
@@ -91,7 +91,7 @@ jobs:
             uploadPreset: "nuxt_unsigned",
           };
           EOF
-      - run: npm install
+      - run: npm ci
       - run: npm run dist:linux
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}

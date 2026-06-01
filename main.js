@@ -13,8 +13,14 @@ const {
   screen,
 } = require("electron");
 const path = require("path");
-const activeWindow = require("active-win");
 const Store = require("electron-store");
+
+let activeWindow = null;
+try {
+  activeWindow = require("active-win");
+} catch (error) {
+  console.warn("active-win is unavailable; activity summary will be limited.");
+}
 
 const store = new Store();
 
@@ -189,19 +195,26 @@ function getDisplaysForSources(sources) {
 }
 
 function getActivitySummary(sources) {
+  if (!activeWindow || typeof activeWindow.sync !== "function") {
+    return "Activity unavailable";
+  }
+
   const currentWindow = activeWindow.sync();
   const fallbackSummary = buildActivitySummary(currentWindow);
   const displays = getDisplaysForSources(sources);
 
-  const windows = activeWindow
-    .getOpenWindowsSync()
-    .map(normalizeWindowInfo)
-    .filter(
-      (windowInfo) =>
-        windowInfo &&
-        windowInfo.bounds &&
-        (windowInfo.title || windowInfo.appName),
-    );
+  const windows =
+    typeof activeWindow.getOpenWindowsSync === "function"
+      ? activeWindow
+          .getOpenWindowsSync()
+          .map(normalizeWindowInfo)
+          .filter(
+            (windowInfo) =>
+              windowInfo &&
+              windowInfo.bounds &&
+              (windowInfo.title || windowInfo.appName),
+          )
+      : [];
 
   if (displays.length <= 1 || windows.length === 0) {
     return fallbackSummary;
