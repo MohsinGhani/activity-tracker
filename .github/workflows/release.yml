@@ -13,17 +13,12 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 18
+          node-version: 22
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
-      - name: Configure npm for node-gyp
-        shell: pwsh
-        run: |
-          npm config set python python
 
       - name: Write client config
         run: |
@@ -45,21 +40,25 @@ jobs:
           "@ | Set-Content config.js
 
       - run: npm ci
+        env:
+          PYTHON: python
 
       - name: Rebuild native modules for Electron
         run: npx electron-builder install-app-deps
+        env:
+          PYTHON: python
 
       - run: npm run dist:win
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
-
+          PYTHON: python
   release_mac:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 18
+          node-version: 22
       - name: Write client config
         run: |
           cat <<EOF > config.js
@@ -78,7 +77,7 @@ jobs:
             uploadPreset: "nuxt_unsigned",
           };
           EOF
-      - run: npm ci --no-optional
+      - run: npm ci
       - run: npx electron-builder install-app-deps
       - run: npm run dist:mac
         env:
@@ -90,7 +89,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 18
+          node-version: 22
       - name: Write client config
         run: |
           cat <<EOF > config.js
@@ -109,7 +108,7 @@ jobs:
             uploadPreset: "nuxt_unsigned",
           };
           EOF
-      - run: npm ci --no-optional
+      - run: npm ci
       - run: npx electron-builder install-app-deps
       - run: npm run dist:linux
         env:
