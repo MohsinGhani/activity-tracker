@@ -15,17 +15,119 @@ const {
 const path = require("path");
 const Store = require("electron-store");
 
-let activeWindow = null;
-try {
-  activeWindow = require("active-win");
-} catch (error) {
-  console.warn("active-win is unavailable; activity summary will be limited.");
-}
-
 const store = new Store();
 
 let mainWindow = null;
 let tray = null;
+let windowsApi = null;
+
+async function getWindowsApi() {
+  if (windowsApi) return windowsApi;
+  const module = await import("get-windows");
+  windowsApi = {
+    activeWindow: module.activeWindow,
+    openWindows: module.openWindows,
+  };
+  return windowsApi;
+}
+
+function extractFileNameFromTitle(title = "") {
+  const prefix = String(title).split(" - ")[0]?.trim();
+  if (!prefix) return null;
+  const candidate = prefix.split(/[\\/]/).pop()?.trim();
+  if (!candidate) return null;
+  if (!/\.[a-z0-9]{1,8}$/i.test(candidate)) return null;
+  return candidate;
+}
+
+function buildActivityContext(activeWindow) {
+  const appName =
+    activeWindow?.owner?.name ||
+    activeWindow?.owner?.processName ||
+    "Unknown app";
+  const windowTitle = activeWindow?.title || "Unknown window";
+  const fileName = extractFileNameFromTitle(windowTitle);
+  const lowerTitle = windowTitle.toLowerCase();
+  const lowerAppName = appName.toLowerCase();
+  const titleAlreadyHasApp =
+    lowerTitle === lowerAppName || lowerTitle.endsWith(` - ${lowerAppName}`);
+
+  const summary = fileName
+    ? `${fileName} ${appName}`
+    : titleAlreadyHasApp
+      ? windowTitle
+      : `${windowTitle} ${appName}`;
+
+  return {
+    summary,
+    appName,
+    windowTitle,
+    fileName,
+  };
+}
+
+function pointInBounds(point, bounds) {
+  if (!point || !bounds) return false;
+  return (
+    point.x >= bounds.x &&
+    point.y >= bounds.y &&
+    point.x < bounds.x + bounds.width &&
+    point.y < bounds.y + bounds.height
+  );
+}
+
+function getWindowCenter(windowInfo) {
+  const bounds = windowInfo?.bounds;
+  if (!bounds) return null;
+  return {
+    x: bounds.x + bounds.width / 2,
+    y: bounds.y + bounds.height / 2,
+  };
+}
+
+function matchWindowForDisplay(windowList, displayBounds) {
+  return windowList.find((windowInfo) => {
+    if (!windowInfo?.title || !windowInfo?.owner) return false;
+    const center = getWindowCenter(windowInfo);
+    return pointInBounds(center, displayBounds);
+  });
+}
+
+async function buildPerScreenActivityContext(displayIds = []) {
+  const api = await getWindowsApi();
+  const [activeWindow, allOpenWindows] = await Promise.all([
+    api.activeWindow(),
+    api.openWindows(),
+  ]);
+
+  const activeContext = buildActivityContext(activeWindow);
+  const openWindows = Array.isArray(allOpenWindows) ? allOpenWindows : [];
+  const displayIdSet = new Set((displayIds || []).filter(Boolean).map(String));
+
+  const displays = screen
+    .getAllDisplays()
+    .filter((display) =>
+      displayIdSet.size === 0 ? true : displayIdSet.has(String(display.id)),
+    );
+
+  const perScreen = displays.map((display, index) => {
+    const matchedWindow = matchWindowForDisplay(openWindows, display.bounds);
+    const context = matchedWindow
+      ? buildActivityContext(matchedWindow)
+      : activeContext;
+
+    return {
+      displayId: String(display.id),
+      screenName: `Screen ${index + 1}`,
+      ...context,
+    };
+  });
+
+  return {
+    active: activeContext,
+    perScreen,
+  };
+}
 
 if (!app.requestSingleInstanceLock()) {
   app.quit();
@@ -99,141 +201,6 @@ function createTray() {
   });
 }
 
-function normalizeWindowInfo(windowInfo) {
-  if (!windowInfo) return null;
-
-  return {
-    title: windowInfo.title?.trim() || null,
-    appName: windowInfo.owner?.name?.trim() || null,
-    processId: windowInfo.owner?.processId ?? null,
-    processPath: windowInfo.owner?.path || null,
-    windowId: windowInfo.id ?? null,
-    bounds: windowInfo.bounds ?? null,
-    platform: windowInfo.platform ?? process.platform,
-  };
-}
-
-function buildActivitySummary(windowInfo) {
-  const normalized = normalizeWindowInfo(windowInfo);
-
-  if (!normalized) return "No active window detected";
-  if (normalized.title && normalized.appName) {
-    return `${normalized.title} - ${normalized.appName}`;
-  }
-
-  return normalized.title || normalized.appName || "Unknown activity";
-}
-
-function getIntersectionArea(firstBounds, secondBounds) {
-  if (!firstBounds || !secondBounds) return 0;
-
-  const left = Math.max(firstBounds.x, secondBounds.x);
-  const top = Math.max(firstBounds.y, secondBounds.y);
-  const right = Math.min(
-    firstBounds.x + firstBounds.width,
-    secondBounds.x + secondBounds.width,
-  );
-  const bottom = Math.min(
-    firstBounds.y + firstBounds.height,
-    secondBounds.y + secondBounds.height,
-  );
-
-  if (right <= left || bottom <= top) return 0;
-  return (right - left) * (bottom - top);
-}
-
-function pickWindowForDisplay(displayBounds, windows, usedWindowIds) {
-  let bestWindow = null;
-  let bestArea = 0;
-
-  for (const windowInfo of windows) {
-    if (usedWindowIds.has(windowInfo.windowId)) continue;
-
-    const overlapArea = getIntersectionArea(windowInfo.bounds, displayBounds);
-    if (overlapArea > bestArea) {
-      bestArea = overlapArea;
-      bestWindow = windowInfo;
-    }
-  }
-
-  if (bestWindow) {
-    usedWindowIds.add(bestWindow.windowId);
-    return bestWindow;
-  }
-
-  for (const windowInfo of windows) {
-    const overlapArea = getIntersectionArea(windowInfo.bounds, displayBounds);
-    if (overlapArea > bestArea) {
-      bestArea = overlapArea;
-      bestWindow = windowInfo;
-    }
-  }
-
-  return bestWindow;
-}
-
-function getDisplaysForSources(sources) {
-  const displaysById = new Map(
-    screen.getAllDisplays().map((display) => [String(display.id), display]),
-  );
-
-  const matchedDisplays = sources
-    .map((source) => displaysById.get(String(source.display_id)))
-    .filter(Boolean);
-
-  if (matchedDisplays.length > 0) {
-    return matchedDisplays;
-  }
-
-  return screen
-    .getAllDisplays()
-    .slice()
-    .sort(
-      (first, second) =>
-        first.bounds.x - second.bounds.x || first.bounds.y - second.bounds.y,
-    );
-}
-
-function getActivitySummary(sources) {
-  if (!activeWindow || typeof activeWindow.sync !== "function") {
-    return "Activity unavailable";
-  }
-
-  const currentWindow = activeWindow.sync();
-  const fallbackSummary = buildActivitySummary(currentWindow);
-  const displays = getDisplaysForSources(sources);
-
-  const windows =
-    typeof activeWindow.getOpenWindowsSync === "function"
-      ? activeWindow
-          .getOpenWindowsSync()
-          .map(normalizeWindowInfo)
-          .filter(
-            (windowInfo) =>
-              windowInfo &&
-              windowInfo.bounds &&
-              (windowInfo.title || windowInfo.appName),
-          )
-      : [];
-
-  if (displays.length <= 1 || windows.length === 0) {
-    return fallbackSummary;
-  }
-
-  const usedWindowIds = new Set();
-  const summaries = displays
-    .map((display) =>
-      pickWindowForDisplay(display.bounds, windows, usedWindowIds),
-    )
-    .filter(Boolean)
-    .map((windowInfo) => buildActivitySummary(windowInfo));
-
-  const uniqueSummaries = [...new Set(summaries.filter(Boolean))];
-  return uniqueSummaries.length > 0
-    ? uniqueSummaries.join(" | ")
-    : fallbackSummary;
-}
-
 ipcMain.handle("take-screenshot", async () => {
   const sources = await desktopCapturer.getSources({
     types: ["screen"],
@@ -242,17 +209,50 @@ ipcMain.handle("take-screenshot", async () => {
   if (!sources || sources.length === 0)
     throw new Error("No screen sources available");
 
-  let activitySummary = null;
-  try {
-    activitySummary = getActivitySummary(sources);
-  } catch (error) {
-    console.error("Failed to capture activity summary:", error);
-  }
+  return sources.map((s, index) => {
+    const fallbackName = `Screen ${index + 1}`;
+    const screenName =
+      s.name && s.name !== "Entire Screen" ? s.name : fallbackName;
 
-  return {
-    dataUrls: sources.map((s) => s.thumbnail.toDataURL()),
-    activitySummary,
-  };
+    return {
+      screenName,
+      displayId: s.display_id ? String(s.display_id) : null,
+      dataUrl: s.thumbnail.toDataURL(),
+    };
+  });
+});
+
+ipcMain.handle("get-activity-contexts", async (_event, displayIds = []) => {
+  try {
+    return await buildPerScreenActivityContext(displayIds);
+  } catch (error) {
+    console.error("Failed to read per-screen activity context:", error);
+    return {
+      active: {
+        summary: "Unknown activity",
+        appName: "Unknown app",
+        windowTitle: "Unknown window",
+        fileName: null,
+      },
+      perScreen: [],
+    };
+  }
+});
+
+ipcMain.handle("get-activity-context", async () => {
+  try {
+    const api = await getWindowsApi();
+    const activeWindow = await api.activeWindow();
+    return buildActivityContext(activeWindow);
+  } catch (error) {
+    console.error("Failed to read active window context:", error);
+    return {
+      summary: "Unknown activity",
+      appName: "Unknown app",
+      windowTitle: "Unknown window",
+      fileName: null,
+    };
+  }
 });
 
 ipcMain.handle("store-get", (_e, key) => store.get(key) ?? null);

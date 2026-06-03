@@ -37,19 +37,20 @@ export async function saveScreenshot(
   userId,
   imageUrl,
   timestamp,
-  activitySummary = null,
+  activityContext = {},
 ) {
+  const hasScreenSummaries =
+    Array.isArray(activityContext.screenSummaries) &&
+    activityContext.screenSummaries.length > 0;
+
   const screenshotDoc = {
     sessionId,
     userId,
     imageUrl,
     timestamp,
+    activitySummary: activityContext.summary || "Unknown activity",
     createdAt: serverTimestamp(),
   };
-
-  if (activitySummary) {
-    screenshotDoc.activitySummary = activitySummary;
-  }
 
   return addDoc(collection(db, "screenshots"), screenshotDoc);
 }

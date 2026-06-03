@@ -11,9 +11,11 @@ import { uploadScreenshot } from "./cloudinary.js";
 let currentUser = null;
 let currentSessionId = null;
 let sessionStartTime = null;
+let sessionStartedAtMs = null;
 let elapsedBeforePauseMs = 0;
 let timerInterval = null;
 let screenshotTimeout = null;
+let midnightTimeout = null;
 let isIdle = false;
 let idlePollInterval = null;
 let isSessionPaused = false;
@@ -88,17 +90,20 @@ startBtn.addEventListener("click", async () => {
     const sessionId = await createSession(currentUser.uid);
     currentSessionId = sessionId;
     sessionStartTime = Date.now();
+    sessionStartedAtMs = sessionStartTime;
     elapsedBeforePauseMs = 0;
     isSessionPaused = false;
 
     await window.tracker.storeSet("sessionId", sessionId);
     await window.tracker.storeSet("sessionStartTime", sessionStartTime);
+    await window.tracker.storeSet("sessionStartedAtMs", sessionStartedAtMs);
     await window.tracker.storeSet("sessionUserId", currentUser.uid);
     await window.tracker.storeSet("sessionElapsedMs", elapsedBeforePauseMs);
     await window.tracker.storeSet("sessionPaused", false);
 
     startTimer();
     scheduleNextScreenshot();
+    scheduleMidnightEnd();
     startIdlePoll();
     setActiveUI();
   } catch (err) {
@@ -144,6 +149,11 @@ async function pauseSession(dueToIdle = false) {
 }
 
 async function resumeSession() {
+  if (isPastSessionMidnight()) {
+    await endCurrentSession();
+    return;
+  }
+
   sessionStartTime = Date.now();
   isSessionPaused = false;
   pausedDueToIdle = false;
@@ -151,6 +161,7 @@ async function resumeSession() {
   await persistSessionState();
   startTimer();
   scheduleNextScreenshot();
+  scheduleMidnightEnd();
   startIdlePoll();
   setActiveUI();
 }
@@ -181,6 +192,7 @@ async function endCurrentSession() {
 async function restoreSession() {
   const sessionId = await window.tracker.storeGet("sessionId");
   const startTime = await window.tracker.storeGet("sessionStartTime");
+  const startedAtMs = await window.tracker.storeGet("sessionStartedAtMs");
   const userId = await window.tracker.storeGet("sessionUserId");
   const elapsedMs = Number(
     (await window.tracker.storeGet("sessionElapsedMs")) ?? 0,
@@ -188,22 +200,80 @@ async function restoreSession() {
   const paused = Boolean(await window.tracker.storeGet("sessionPaused"));
 
   if (sessionId && userId === currentUser.uid) {
+    const restoredStartTime = Number(startTime);
+    sessionStartedAtMs = Number.isFinite(Number(startedAtMs))
+      ? Number(startedAtMs)
+      : restoredStartTime;
+
+    if (
+      Number.isFinite(sessionStartedAtMs) &&
+      hasCrossedMidnight(sessionStartedAtMs)
+    ) {
+      await rolloverSessionAfterMidnight();
+      return;
+    }
+
     currentSessionId = sessionId;
     elapsedBeforePauseMs = elapsedMs;
     isSessionPaused = paused;
-    sessionStartTime = paused ? null : Number(startTime);
+    sessionStartTime = paused ? null : restoredStartTime;
 
     if (isSessionPaused) {
       renderTimer();
       setPausedUI();
+      scheduleMidnightEnd();
       return;
     }
 
     startTimer();
     scheduleNextScreenshot();
+    scheduleMidnightEnd();
     startIdlePoll();
     setActiveUI();
   }
+}
+
+async function rolloverSessionAfterMidnight() {
+  const rolloverEndTime = new Date(getNextMidnightMs(sessionStartedAtMs));
+  const rolloverDuration = Math.max(
+    0,
+    Math.floor((rolloverEndTime.getTime() - sessionStartedAtMs) / 1000),
+  );
+
+  try {
+    await endSession(
+      currentSessionId,
+      rolloverDuration,
+      rolloverEndTime,
+      new Date(sessionStartedAtMs),
+    );
+  } catch (err) {
+    console.error("Failed to close previous session at midnight:", err);
+  }
+
+  await clearStoredSession();
+  clearSessionState();
+
+  const freshSessionId = await createSession(currentUser.uid);
+  currentSessionId = freshSessionId;
+  sessionStartTime = Date.now();
+  sessionStartedAtMs = sessionStartTime;
+  elapsedBeforePauseMs = 0;
+  isSessionPaused = false;
+
+  await window.tracker.storeSet("sessionId", freshSessionId);
+  await window.tracker.storeSet("sessionStartTime", sessionStartTime);
+  await window.tracker.storeSet("sessionStartedAtMs", sessionStartedAtMs);
+  await window.tracker.storeSet("sessionUserId", currentUser.uid);
+  await window.tracker.storeSet("sessionElapsedMs", elapsedBeforePauseMs);
+  await window.tracker.storeSet("sessionPaused", false);
+
+  startTimer();
+  scheduleNextScreenshot();
+  scheduleMidnightEnd();
+  startIdlePoll();
+  setActiveUI();
+  showToast("Previous session ended at 12:00 AM. New session started.");
 }
 
 function startTimer() {
@@ -234,8 +304,8 @@ function pad(n) {
   return String(n).padStart(2, "0");
 }
 
-const MIN_SCREENSHOT_DELAY_MS = 8 * 60 * 1000;
-const MAX_SCREENSHOT_DELAY_MS = 10 * 60 * 1000;
+const MIN_SCREENSHOT_DELAY_MS = 1 * 60 * 1000;
+const MAX_SCREENSHOT_DELAY_MS = 1 * 60 * 1000;
 
 function startIdlePoll() {
   stopIdlePoll();
@@ -288,6 +358,45 @@ function scheduleNextScreenshot() {
   screenshotTimeout = setTimeout(captureAndUpload, delay);
 }
 
+function getNextMidnightMs(referenceMs = Date.now()) {
+  const nextMidnight = new Date(referenceMs);
+  nextMidnight.setHours(24, 0, 0, 0);
+  return nextMidnight.getTime();
+}
+
+function hasCrossedMidnight(startMs, referenceMs = Date.now()) {
+  const startDate = new Date(startMs);
+  const referenceDate = new Date(referenceMs);
+  return (
+    startDate.getFullYear() !== referenceDate.getFullYear() ||
+    startDate.getMonth() !== referenceDate.getMonth() ||
+    startDate.getDate() !== referenceDate.getDate()
+  );
+}
+
+function isPastSessionMidnight(referenceMs = Date.now()) {
+  if (!sessionStartedAtMs) return false;
+  return hasCrossedMidnight(sessionStartedAtMs, referenceMs);
+}
+
+function clearMidnightTimer() {
+  clearTimeout(midnightTimeout);
+  midnightTimeout = null;
+}
+
+function scheduleMidnightEnd() {
+  clearMidnightTimer();
+  if (!currentSessionId) return;
+
+  const now = Date.now();
+  const delay = Math.max(0, getNextMidnightMs(now) - now);
+  midnightTimeout = setTimeout(async () => {
+    if (!currentSessionId) return;
+    showToast("Session ended at 12:00 AM.");
+    await endCurrentSession();
+  }, delay);
+}
+
 function loadImage(url) {
   return new Promise((resolve, reject) => {
     const img = new Image();
@@ -322,28 +431,94 @@ async function stitchScreenshots(dataUrls) {
   return canvas.toDataURL("image/png");
 }
 
+function normalizeCapturedScreens(captureResult) {
+  if (!Array.isArray(captureResult)) {
+    if (Array.isArray(captureResult?.dataUrls)) {
+      return captureResult.dataUrls.map((dataUrl, index) => ({
+        screenName: `Screen ${index + 1}`,
+        displayId: null,
+        dataUrl,
+      }));
+    }
+    return [];
+  }
+
+  return captureResult
+    .map((item, index) => {
+      if (typeof item === "string") {
+        return {
+          screenName: `Screen ${index + 1}`,
+          displayId: null,
+          dataUrl: item,
+        };
+      }
+
+      const dataUrl = item?.dataUrl;
+      if (!dataUrl) return null;
+
+      return {
+        screenName: item.screenName || `Screen ${index + 1}`,
+        displayId: item.displayId ? String(item.displayId) : null,
+        dataUrl,
+      };
+    })
+    .filter(Boolean);
+}
+
 async function captureAndUpload() {
   if (!currentSessionId || !currentUser || isSessionPaused) return;
 
   try {
     const captureResult = await window.tracker.takeScreenshot();
-    const dataUrls = Array.isArray(captureResult)
-      ? captureResult
-      : captureResult?.dataUrls;
-    const activitySummary = Array.isArray(captureResult)
-      ? null
-      : (captureResult?.activitySummary ?? null);
+    const capturedScreens = normalizeCapturedScreens(captureResult);
+    const dataUrls = capturedScreens.map((screen) => screen.dataUrl);
+
+    if (dataUrls.length === 0) {
+      throw new Error("No screenshot data received");
+    }
 
     const stitched = await stitchScreenshots(dataUrls);
     const imageUrl = await uploadScreenshot(stitched);
     const now = new Date();
+
+    const displayIds = capturedScreens
+      .map((screen) => screen.displayId)
+      .filter(Boolean);
+    const activityContexts =
+      await window.tracker.getActivityContexts(displayIds);
+    const activeContext = activityContexts?.active || {
+      summary: "Unknown activity",
+    };
+
+    const perScreenContextMap = new Map(
+      (activityContexts?.perScreen || [])
+        .filter((item) => item?.displayId)
+        .map((item) => [String(item.displayId), item]),
+    );
+
+    const screenSummaries = capturedScreens.map((screen) => {
+      const perScreen = screen.displayId
+        ? perScreenContextMap.get(String(screen.displayId))
+        : null;
+      const summary =
+        perScreen?.summary || activeContext.summary || "Unknown activity";
+      return `${screen.screenName}: ${summary}`;
+    });
+    const combinedSummary = screenSummaries.join(" | ");
+
+    console.log("Screen activities:", screenSummaries);
 
     await saveScreenshot(
       currentSessionId,
       currentUser.uid,
       imageUrl,
       now.toISOString(),
-      activitySummary,
+      {
+        ...activeContext,
+        summary: combinedSummary || activeContext.summary || "Unknown activity",
+        screenCount: capturedScreens.length,
+        screenSummaries,
+      },
     );
 
     const timeStr = now.toLocaleTimeString("en-US", {
@@ -351,12 +526,12 @@ async function captureAndUpload() {
       minute: "2-digit",
       hour12: true,
     });
-    const activitySuffix = activitySummary ? ` - ${activitySummary}` : "";
 
-    showToast(`Screenshot captured at ${timeStr}${activitySuffix}`);
+    const activityText = combinedSummary ? ` (${combinedSummary})` : "";
+    showToast(`Screenshot captured at ${timeStr}${activityText}`);
     await window.tracker.showNotification(
       "Team Tracker",
-      `Screenshot captured at ${timeStr}${activitySuffix}`,
+      `Screenshot captured at ${timeStr}${activityText}`,
     );
   } catch (err) {
     console.error("Screenshot capture/upload failed:", err);
@@ -442,12 +617,14 @@ function clearTimers() {
   timerInterval = null;
   clearTimeout(screenshotTimeout);
   screenshotTimeout = null;
+  clearMidnightTimer();
   stopIdlePoll();
 }
 
 function clearSessionState() {
   currentSessionId = null;
   sessionStartTime = null;
+  sessionStartedAtMs = null;
   elapsedBeforePauseMs = 0;
   isIdle = false;
   isSessionPaused = false;
@@ -458,6 +635,7 @@ function clearSessionState() {
 async function clearStoredSession() {
   await window.tracker.storeSet("sessionId", null);
   await window.tracker.storeSet("sessionStartTime", null);
+  await window.tracker.storeSet("sessionStartedAtMs", null);
   await window.tracker.storeSet("sessionUserId", null);
   await window.tracker.storeSet("sessionElapsedMs", null);
   await window.tracker.storeSet("sessionPaused", null);
@@ -465,6 +643,7 @@ async function clearStoredSession() {
 
 async function persistSessionState() {
   await window.tracker.storeSet("sessionStartTime", sessionStartTime);
+  await window.tracker.storeSet("sessionStartedAtMs", sessionStartedAtMs);
   await window.tracker.storeSet("sessionElapsedMs", elapsedBeforePauseMs);
   await window.tracker.storeSet("sessionPaused", isSessionPaused);
 }
