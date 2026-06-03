@@ -7,108 +7,110 @@ on:
 
 jobs:
   release_windows:
-  runs-on: windows-latest
-  steps:
-    - uses: actions/checkout@v3
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
 
-    - uses: actions/setup-node@v3
-      with:
-        node-version: 18
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
 
-    - name: Setup Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: "3.11"
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-    - name: Configure npm for node-gyp
-      shell: pwsh
-      run: |
-        npm config set python python
+      - name: Configure npm for node-gyp
+        shell: pwsh
+        run: |
+          npm config set python python
 
-    - name: Write client config
-      run: |
-        @"
-        export const firebaseConfig = {
-          apiKey: "AIzaSyDphA090liCwD1C6TDPfjZrZFewnk5Z3yI",
-          authDomain: "employee-management-8cb26.firebaseapp.com",
-          projectId: "employee-management-8cb26",
-          storageBucket: "employee-management-8cb26.firebasestorage.app",
-          messagingSenderId: "241361442701",
-          appId: "1:241361442701:web:b6b3c26265636382868fc4",
-          measurementId: "G-6QSGNVYT4Q",
-        };
+      - name: Write client config
+        run: |
+          @"
+          export const firebaseConfig = {
+            apiKey: "AIzaSyDphA090liCwD1C6TDPfjZrZFewnk5Z3yI",
+            authDomain: "employee-management-8cb26.firebaseapp.com",
+            projectId: "employee-management-8cb26",
+            storageBucket: "employee-management-8cb26.firebasestorage.app",
+            messagingSenderId: "241361442701",
+            appId: "1:241361442701:web:b6b3c26265636382868fc4",
+            measurementId: "G-6QSGNVYT4Q",
+          };
 
-        export const cloudinaryConfig = {
-          cloudName: "dlyktw5s5",
-          uploadPreset: "nuxt_unsigned",
-        };
-        "@ | Set-Content config.js
+          export const cloudinaryConfig = {
+            cloudName: "dlyktw5s5",
+            uploadPreset: "nuxt_unsigned",
+          };
+          "@ | Set-Content config.js
 
-    - run: npm ci
+      - run: npm ci
 
-    - name: Rebuild native modules for Electron
-      run: npx electron-builder install-app-deps
+      - name: Rebuild native modules for Electron
+        run: npx electron-builder install-app-deps
 
-    - run: npm run dist:win
-      env:
-        GH_TOKEN: ${{ secrets.GH_TOKEN }}
+      - run: npm run dist:win
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
 
   release_mac:
-  runs-on: macos-latest
-  steps:
-    - uses: actions/checkout@v3
-    - uses: actions/setup-node@v3
-      with:
-        node-version: 18
-    - name: Write client config
-      run: |
-        cat <<EOF > config.js
-        export const firebaseConfig = {
-          apiKey: "AIzaSyDphA090liCwD1C6TDPfjZrZFewnk5Z3yI",
-          authDomain: "employee-management-8cb26.firebaseapp.com",
-          projectId: "employee-management-8cb26",
-          storageBucket: "employee-management-8cb26.firebasestorage.app",
-          messagingSenderId: "241361442701",
-          appId: "1:241361442701:web:b6b3c26265636382868fc4",
-          measurementId: "G-6QSGNVYT4Q",
-        };
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+      - name: Write client config
+        run: |
+          cat <<EOF > config.js
+          export const firebaseConfig = {
+            apiKey: "AIzaSyDphA090liCwD1C6TDPfjZrZFewnk5Z3yI",
+            authDomain: "employee-management-8cb26.firebaseapp.com",
+            projectId: "employee-management-8cb26",
+            storageBucket: "employee-management-8cb26.firebasestorage.app",
+            messagingSenderId: "241361442701",
+            appId: "1:241361442701:web:b6b3c26265636382868fc4",
+            measurementId: "G-6QSGNVYT4Q",
+          };
 
-        export const cloudinaryConfig = {
-          cloudName: "dlyktw5s5",
-          uploadPreset: "nuxt_unsigned",
-        };
-        EOF
-    - run: npm ci --no-optional
-    - run: npm run dist:mac
-      env:
-        GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          export const cloudinaryConfig = {
+            cloudName: "dlyktw5s5",
+            uploadPreset: "nuxt_unsigned",
+          };
+          EOF
+      - run: npm ci --no-optional
+      - run: npx electron-builder install-app-deps
+      - run: npm run dist:mac
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
 
- release_linux:
-  runs-on: ubuntu-latest
-  steps:
-    - uses: actions/checkout@v3
-    - uses: actions/setup-node@v3
-      with:
-        node-version: 18
-    - name: Write client config
-      run: |
-        cat <<EOF > config.js
-        export const firebaseConfig = {
-          apiKey: "AIzaSyDphA090liCwD1C6TDPfjZrZFewnk5Z3yI",
-          authDomain: "employee-management-8cb26.firebaseapp.com",
-          projectId: "employee-management-8cb26",
-          storageBucket: "employee-management-8cb26.firebasestorage.app",
-          messagingSenderId: "241361442701",
-          appId: "1:241361442701:web:b6b3c26265636382868fc4",
-          measurementId: "G-6QSGNVYT4Q",
-        };
+  release_linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+      - name: Write client config
+        run: |
+          cat <<EOF > config.js
+          export const firebaseConfig = {
+            apiKey: "AIzaSyDphA090liCwD1C6TDPfjZrZFewnk5Z3yI",
+            authDomain: "employee-management-8cb26.firebaseapp.com",
+            projectId: "employee-management-8cb26",
+            storageBucket: "employee-management-8cb26.firebasestorage.app",
+            messagingSenderId: "241361442701",
+            appId: "1:241361442701:web:b6b3c26265636382868fc4",
+            measurementId: "G-6QSGNVYT4Q",
+          };
 
-        export const cloudinaryConfig = {
-          cloudName: "dlyktw5s5",
-          uploadPreset: "nuxt_unsigned",
-        };
-        EOF
-    - run: npm ci --no-optional
-    - run: npm run dist:linux
-      env:
-        GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          export const cloudinaryConfig = {
+            cloudName: "dlyktw5s5",
+            uploadPreset: "nuxt_unsigned",
+          };
+          EOF
+      - run: npm ci --no-optional
+      - run: npx electron-builder install-app-deps
+      - run: npm run dist:linux
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}

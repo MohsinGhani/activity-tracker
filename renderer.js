@@ -201,6 +201,10 @@ async function restoreSession() {
 
   if (sessionId && userId === currentUser.uid) {
     const restoredStartTime = Number(startTime);
+    currentSessionId = sessionId;
+    elapsedBeforePauseMs = elapsedMs;
+    isSessionPaused = paused;
+    sessionStartTime = paused ? null : restoredStartTime;
     sessionStartedAtMs = Number.isFinite(Number(startedAtMs))
       ? Number(startedAtMs)
       : restoredStartTime;
@@ -212,11 +216,6 @@ async function restoreSession() {
       await rolloverSessionAfterMidnight();
       return;
     }
-
-    currentSessionId = sessionId;
-    elapsedBeforePauseMs = elapsedMs;
-    isSessionPaused = paused;
-    sessionStartTime = paused ? null : restoredStartTime;
 
     if (isSessionPaused) {
       renderTimer();
@@ -235,9 +234,8 @@ async function restoreSession() {
 
 async function rolloverSessionAfterMidnight() {
   const rolloverEndTime = new Date(getNextMidnightMs(sessionStartedAtMs));
-  const rolloverDuration = Math.max(
-    0,
-    Math.floor((rolloverEndTime.getTime() - sessionStartedAtMs) / 1000),
+  const rolloverDuration = Math.floor(
+    getElapsedMsAt(rolloverEndTime.getTime()) / 1000,
   );
 
   try {
@@ -294,6 +292,12 @@ function getElapsedMs() {
   if (!currentSessionId) return 0;
   if (!sessionStartTime) return elapsedBeforePauseMs;
   return elapsedBeforePauseMs + (Date.now() - sessionStartTime);
+}
+
+function getElapsedMsAt(referenceMs) {
+  if (!currentSessionId) return 0;
+  if (!sessionStartTime) return elapsedBeforePauseMs;
+  return elapsedBeforePauseMs + Math.max(0, referenceMs - sessionStartTime);
 }
 
 function getEffectiveSessionStartDate(referenceMs = Date.now()) {
