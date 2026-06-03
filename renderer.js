@@ -5,6 +5,7 @@ import {
   saveScreenshot,
   createSession,
   endSession,
+  getTodaySessionsSummary,
 } from "./firebase.js";
 import { uploadScreenshot } from "./cloudinary.js";
 
@@ -21,6 +22,7 @@ let idlePollInterval = null;
 let isSessionPaused = false;
 let pausedDueToIdle = false;
 let idleResumeInProgress = false;
+let todayEndedSeconds = 0;
 
 const loginView = document.getElementById("login-view");
 const dashView = document.getElementById("dashboard-view");
@@ -34,6 +36,7 @@ const startBtn = document.getElementById("start-btn");
 const stopBtn = document.getElementById("stop-btn");
 const endBtn = document.getElementById("end-btn");
 const statusText = document.getElementById("status-text");
+const todayTotalTime = document.getElementById("today-total-time");
 const toastArea = document.getElementById("toast-area");
 const logoutBtn = document.getElementById("logout-btn");
 
@@ -42,9 +45,13 @@ onAuthChange(async (user) => {
   if (user) {
     showDashboard(user);
     await restoreSession();
+    await refreshTodayEndedSeconds();
+    renderTodayTotalTime();
   } else {
     clearTimers();
     clearSessionState();
+    todayEndedSeconds = 0;
+    renderTodayTotalTime();
     showLogin();
   }
 });
@@ -105,6 +112,7 @@ startBtn.addEventListener("click", async () => {
     scheduleNextScreenshot();
     scheduleMidnightEnd();
     startIdlePoll();
+    renderTodayTotalTime();
     setActiveUI();
   } catch (err) {
     console.error("Failed to start session:", err);
@@ -186,6 +194,8 @@ async function endCurrentSession() {
 
   await clearStoredSession();
   clearSessionState();
+  await refreshTodayEndedSeconds();
+  renderTodayTotalTime();
   setInactiveUI();
 }
 
@@ -270,6 +280,8 @@ async function rolloverSessionAfterMidnight() {
   scheduleNextScreenshot();
   scheduleMidnightEnd();
   startIdlePoll();
+  await refreshTodayEndedSeconds();
+  renderTodayTotalTime();
   setActiveUI();
   showToast("Previous session ended at 12:00 AM. New session started.");
 }
@@ -286,6 +298,54 @@ function renderTimer() {
   const m = Math.floor((secs % 3600) / 60);
   const s = secs % 60;
   timerDisplay.textContent = `${pad(h)}h ${pad(m)}m ${pad(s)}s`;
+  renderTodayTotalTime();
+}
+
+function getLocalDayRange() {
+  const now = new Date();
+  const dayStart = new Date(now);
+  dayStart.setHours(0, 0, 0, 0);
+
+  const dayEnd = new Date(dayStart);
+  dayEnd.setDate(dayEnd.getDate() + 1);
+
+  return { dayStart, dayEnd };
+}
+
+async function refreshTodayEndedSeconds() {
+  if (!currentUser) {
+    todayEndedSeconds = 0;
+    return;
+  }
+
+  const { dayStart, dayEnd } = getLocalDayRange();
+  try {
+    const summary = await getTodaySessionsSummary(
+      currentUser.uid,
+      dayStart,
+      dayEnd,
+    );
+    todayEndedSeconds = summary.totalEndedSeconds;
+
+    console.log("Today's sessions summary", {
+      date: dayStart.toLocaleDateString(),
+      userId: summary.userId,
+      count: summary.sessions.length,
+      totalEndedSeconds: summary.totalEndedSeconds,
+    });
+  } catch (err) {
+    console.error("Failed to load today's total time:", err);
+  }
+}
+
+function renderTodayTotalTime() {
+  if (!todayTotalTime) return;
+  const currentSessionSeconds = Math.floor(getElapsedMs() / 1000);
+  const totalSeconds = Math.max(0, todayEndedSeconds + currentSessionSeconds);
+  const h = Math.floor(totalSeconds / 3600);
+  const m = Math.floor((totalSeconds % 3600) / 60);
+  const s = totalSeconds % 60;
+  todayTotalTime.textContent = `${pad(h)}h ${pad(m)}m ${pad(s)}s`;
 }
 
 function getElapsedMs() {
@@ -308,8 +368,8 @@ function pad(n) {
   return String(n).padStart(2, "0");
 }
 
-const MIN_SCREENSHOT_DELAY_MS = 1 * 60 * 1000;
-const MAX_SCREENSHOT_DELAY_MS = 1 * 60 * 1000;
+const MIN_SCREENSHOT_DELAY_MS = 8 * 60 * 1000;
+const MAX_SCREENSHOT_DELAY_MS = 10 * 60 * 1000;
 
 function startIdlePoll() {
   stopIdlePoll();

@@ -16,6 +16,7 @@ const path = require("path");
 const Store = require("electron-store");
 
 const store = new Store();
+const isDev = !app.isPackaged;
 
 let mainWindow = null;
 let tray = null;
@@ -129,17 +130,19 @@ async function buildPerScreenActivityContext(displayIds = []) {
   };
 }
 
-if (!app.requestSingleInstanceLock()) {
-  app.quit();
-  process.exit(0);
-}
-
-app.on("second-instance", () => {
-  if (mainWindow) {
-    mainWindow.show();
-    mainWindow.focus();
+if (!isDev) {
+  if (!app.requestSingleInstanceLock()) {
+    app.quit();
+    process.exit(0);
   }
-});
+
+  app.on("second-instance", () => {
+    if (mainWindow) {
+      mainWindow.show();
+      mainWindow.focus();
+    }
+  });
+}
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -156,7 +159,7 @@ function createWindow() {
   mainWindow.loadFile("index.html");
 
   mainWindow.on("close", (event) => {
-    if (!app.isQuitting) {
+    if (!isDev && !app.isQuitting) {
       event.preventDefault();
       mainWindow.hide();
     }
@@ -273,7 +276,9 @@ ipcMain.handle("get-idle-state", () =>
 
 app.whenReady().then(() => {
   createWindow();
-  createTray();
+  if (!isDev) {
+    createTray();
+  }
 });
 
 app.on("window-all-closed", () => {});
