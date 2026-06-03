@@ -304,8 +304,8 @@ function pad(n) {
   return String(n).padStart(2, "0");
 }
 
-const MIN_SCREENSHOT_DELAY_MS = 1 * 60 * 1000;
-const MAX_SCREENSHOT_DELAY_MS = 1 * 60 * 1000;
+const MIN_SCREENSHOT_DELAY_MS = 8 * 60 * 1000;
+const MAX_SCREENSHOT_DELAY_MS = 10 * 60 * 1000;
 
 function startIdlePoll() {
   stopIdlePoll();
