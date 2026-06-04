@@ -12,4 +12,10 @@ contextBridge.exposeInMainWorld("tracker", {
   storeSet: (key, value) => ipcRenderer.invoke("store-set", key, value),
   showNotification: (title, body) =>
     ipcRenderer.invoke("show-notification", title, body),
+  onAppClosing: (callback) => {
+    const listener = () => callback();
+    ipcRenderer.on("app-closing", listener);
+    return () => ipcRenderer.removeListener("app-closing", listener);
+  },
+  notifyAppClosingDone: () => ipcRenderer.send("app-closing-done"),
 });

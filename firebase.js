@@ -89,15 +89,16 @@ export async function getTodaySessionsSummary(userId, dayStart, dayEnd) {
 
   const sessions = [];
   let totalEndedSeconds = 0;
+  const dayStartMs = dayStart.getTime();
+  const dayEndMs = dayEnd.getTime();
 
   snapshot.forEach((item) => {
     const data = item.data();
     const startDate = toDateOrNull(data?.startTime);
     const endDate = toDateOrNull(data?.endTime);
-    const markerDate = endDate || startDate;
+    const status = data?.status || "unknown";
 
-    if (!markerDate) return;
-    if (markerDate < dayStart || markerDate >= dayEnd) return;
+    if (!startDate) return;
 
     let duration = Number(data?.duration ?? 0);
     if (!Number.isFinite(duration) && startDate && endDate) {
@@ -105,17 +106,35 @@ export async function getTodaySessionsSummary(userId, dayStart, dayEnd) {
     }
 
     const normalizedDuration = Math.max(0, Math.floor(duration || 0));
-    const status = data?.status || "unknown";
 
+    let endedSecondsForToday = 0;
     if (status === "ended") {
-      totalEndedSeconds += normalizedDuration;
+      // Count only the part of the session that falls inside today's local range.
+      const sessionStartMs = startDate.getTime();
+      const fallbackEndMs = sessionStartMs + normalizedDuration * 1000;
+      const sessionEndMs = endDate?.getTime() || fallbackEndMs;
+      const overlapStartMs = Math.max(sessionStartMs, dayStartMs);
+      const overlapEndMs = Math.min(sessionEndMs, dayEndMs);
+      const overlapMs = Math.max(0, overlapEndMs - overlapStartMs);
+      endedSecondsForToday = Math.floor(overlapMs / 1000);
+      totalEndedSeconds += endedSecondsForToday;
     }
+
+    const markerDate = endDate || startDate;
+    const touchesToday =
+      Math.min(endDate?.getTime() || startDate.getTime(), dayEndMs) >
+      Math.max(startDate.getTime(), dayStartMs);
+
+    if (!markerDate && !touchesToday) return;
+    if (!touchesToday && (markerDate < dayStart || markerDate >= dayEnd))
+      return;
 
     sessions.push({
       id: item.id,
       userId: data?.userId || userId,
       status,
       duration: normalizedDuration,
+      endedSecondsForToday,
       startTime: startDate,
       endTime: endDate,
     });

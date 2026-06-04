@@ -21,6 +21,37 @@ const isDev = !app.isPackaged;
 let mainWindow = null;
 let tray = null;
 let windowsApi = null;
+let isCloseFlowInProgress = false;
+
+function requestSessionEndBeforeQuit(timeoutMs = 10000) {
+  return new Promise((resolve) => {
+    if (!mainWindow || mainWindow.isDestroyed() || !mainWindow.webContents) {
+      resolve();
+      return;
+    }
+
+    let resolved = false;
+    const finish = () => {
+      if (resolved) return;
+      resolved = true;
+      clearTimeout(timeoutHandle);
+      ipcMain.removeListener("app-closing-done", onDone);
+      resolve();
+    };
+
+    const onDone = () => finish();
+    const timeoutHandle = setTimeout(finish, timeoutMs);
+
+    ipcMain.once("app-closing-done", onDone);
+
+    try {
+      mainWindow.webContents.send("app-closing");
+    } catch (error) {
+      console.error("Failed to notify renderer about app close:", error);
+      finish();
+    }
+  });
+}
 
 async function getWindowsApi() {
   if (windowsApi) return windowsApi;
@@ -158,10 +189,21 @@ function createWindow() {
 
   mainWindow.loadFile("index.html");
 
-  mainWindow.on("close", (event) => {
-    if (!isDev && !app.isQuitting) {
-      event.preventDefault();
-      mainWindow.hide();
+  mainWindow.on("close", async (event) => {
+    if (app.isQuitting || isCloseFlowInProgress) {
+      return;
+    }
+
+    event.preventDefault();
+    isCloseFlowInProgress = true;
+
+    try {
+      await requestSessionEndBeforeQuit();
+    } catch (error) {
+      console.error("Failed to end session before quit:", error);
+    } finally {
+      app.isQuitting = true;
+      app.quit();
     }
   });
 }

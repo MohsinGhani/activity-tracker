@@ -23,6 +23,7 @@ let isSessionPaused = false;
 let pausedDueToIdle = false;
 let idleResumeInProgress = false;
 let todayEndedSeconds = 0;
+let isAppClosingHandled = false;
 
 const loginView = document.getElementById("login-view");
 const dashView = document.getElementById("dashboard-view");
@@ -39,6 +40,24 @@ const statusText = document.getElementById("status-text");
 const todayTotalTime = document.getElementById("today-total-time");
 const toastArea = document.getElementById("toast-area");
 const logoutBtn = document.getElementById("logout-btn");
+
+window.tracker.onAppClosing(async () => {
+  if (isAppClosingHandled) {
+    window.tracker.notifyAppClosingDone();
+    return;
+  }
+
+  isAppClosingHandled = true;
+  try {
+    if (currentSessionId) {
+      await endCurrentSession();
+    }
+  } catch (err) {
+    console.error("Failed to end session on app close:", err);
+  } finally {
+    window.tracker.notifyAppClosingDone();
+  }
+});
 
 onAuthChange(async (user) => {
   currentUser = user;
