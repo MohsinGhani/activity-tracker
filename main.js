@@ -8,12 +8,14 @@ const {
   Menu,
   desktopCapturer,
   Notification,
+  dialog,
   nativeImage,
   powerMonitor,
   screen,
 } = require("electron");
 const path = require("path");
 const Store = require("electron-store");
+const { autoUpdater } = require("electron-updater");
 
 const store = new Store();
 const isDev = !app.isPackaged;
@@ -22,8 +24,98 @@ let mainWindow = null;
 let tray = null;
 let windowsApi = null;
 let isCloseFlowInProgress = false;
+let hasHandledPreQuit = false;
+let updateCheckInterval = null;
 
-function requestSessionEndBeforeQuit(timeoutMs = 10000) {
+const UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
+
+function sendUpdateStatus(status, detail = null) {
+  if (!mainWindow || mainWindow.isDestroyed() || !mainWindow.webContents) {
+    return;
+  }
+
+  mainWindow.webContents.send("update-status", {
+    status,
+    detail,
+  });
+}
+
+async function checkForUpdatesSafe() {
+  if (isDev) return null;
+
+  try {
+    return await autoUpdater.checkForUpdates();
+  } catch (error) {
+    const message = error?.message || String(error);
+    console.error("Auto-update check failed:", message);
+    sendUpdateStatus("error", message);
+    return null;
+  }
+}
+
+function scheduleAutoUpdateChecks() {
+  clearInterval(updateCheckInterval);
+  updateCheckInterval = setInterval(() => {
+    void checkForUpdatesSafe();
+  }, UPDATE_CHECK_INTERVAL_MS);
+}
+
+function configureAutoUpdates() {
+  if (isDev) return;
+
+  autoUpdater.autoDownload = true;
+  autoUpdater.autoInstallOnAppQuit = true;
+
+  autoUpdater.on("checking-for-update", () => {
+    sendUpdateStatus("checking");
+  });
+
+  autoUpdater.on("update-available", (info) => {
+    sendUpdateStatus("available", info?.version || null);
+  });
+
+  autoUpdater.on("update-not-available", () => {
+    sendUpdateStatus("not-available");
+  });
+
+  autoUpdater.on("download-progress", (progress) => {
+    sendUpdateStatus("downloading", {
+      percent: Number(progress?.percent || 0),
+      transferred: progress?.transferred || 0,
+      total: progress?.total || 0,
+    });
+  });
+
+  autoUpdater.on("update-downloaded", (info) => {
+    const version = info?.version || "latest";
+    const body = `Version ${version} is ready and will install when you close the app.`;
+
+    sendUpdateStatus("downloaded", version);
+    if (Notification.isSupported()) {
+      new Notification({
+        title: "Activity Tracker update ready",
+        body,
+      }).show();
+    } else {
+      void dialog.showMessageBox({
+        type: "info",
+        title: "Activity Tracker update ready",
+        message: body,
+      });
+    }
+  });
+
+  autoUpdater.on("error", (error) => {
+    const message = error?.message || String(error);
+    console.error("Auto-update error:", message);
+    sendUpdateStatus("error", message);
+  });
+
+  void checkForUpdatesSafe();
+  scheduleAutoUpdateChecks();
+}
+
+function requestSessionEndBeforeQuit(timeoutMs = 20000) {
   return new Promise((resolve) => {
     if (!mainWindow || mainWindow.isDestroyed() || !mainWindow.webContents) {
       resolve();
@@ -53,13 +145,50 @@ function requestSessionEndBeforeQuit(timeoutMs = 10000) {
   });
 }
 
+async function runPreQuitFlow() {
+  if (hasHandledPreQuit || isCloseFlowInProgress) {
+    return;
+  }
+
+  isCloseFlowInProgress = true;
+  hasHandledPreQuit = true;
+
+  // Only set pendingSessionEndAtMs if not already set by shutdown handler
+  if (
+    !store.has("pendingSessionEndAtMs") ||
+    !store.get("pendingSessionEndAtMs")
+  ) {
+    store.set("pendingSessionEndAtMs", Date.now());
+  }
+
+  try {
+    await requestSessionEndBeforeQuit();
+  } catch (error) {
+    console.error("Failed to end session before quit:", error);
+  } finally {
+    app.isQuitting = true;
+    app.quit();
+  }
+}
+
 async function getWindowsApi() {
   if (windowsApi) return windowsApi;
-  const module = await import("get-windows");
-  windowsApi = {
-    activeWindow: module.activeWindow,
-    openWindows: module.openWindows,
-  };
+
+  if (process.platform === "win32") {
+    const module = await import("get-windows");
+    windowsApi = {
+      activeWindow: module.activeWindow,
+      openWindows: module.openWindows,
+    };
+  } else {
+    const module = await import("active-win");
+    const getActiveWindow = module.default || module;
+    windowsApi = {
+      activeWindow: async () => getActiveWindow(),
+      openWindows: async () => [],
+    };
+  }
+
   return windowsApi;
 }
 
@@ -190,21 +319,12 @@ function createWindow() {
   mainWindow.loadFile("index.html");
 
   mainWindow.on("close", async (event) => {
-    if (app.isQuitting || isCloseFlowInProgress) {
+    if (app.isQuitting || hasHandledPreQuit || isCloseFlowInProgress) {
       return;
     }
 
     event.preventDefault();
-    isCloseFlowInProgress = true;
-
-    try {
-      await requestSessionEndBeforeQuit();
-    } catch (error) {
-      console.error("Failed to end session before quit:", error);
-    } finally {
-      app.isQuitting = true;
-      app.quit();
-    }
+    void runPreQuitFlow();
   });
 }
 
@@ -234,7 +354,6 @@ function createTray() {
       {
         label: "Quit",
         click: () => {
-          app.isQuitting = true;
           app.quit();
         },
       },
@@ -244,6 +363,18 @@ function createTray() {
     mainWindow.show();
     mainWindow.focus();
   });
+}
+
+function enableAutoLaunch() {
+  try {
+    app.setLoginItemSettings({
+      openAtLogin: true,
+      path: process.execPath,
+      args: [],
+    });
+  } catch (error) {
+    console.error("Failed to enable auto-launch on startup:", error);
+  }
 }
 
 ipcMain.handle("take-screenshot", async () => {
@@ -311,20 +442,64 @@ ipcMain.handle("show-notification", (_e, title, body) => {
   if (Notification.isSupported()) new Notification({ title, body }).show();
 });
 
+ipcMain.handle("check-for-updates", async () => {
+  const result = await checkForUpdatesSafe();
+  return Boolean(result);
+});
+
+ipcMain.handle("session-end-confirmed", () => {
+  console.log("Renderer confirmed session saved to Firebase");
+});
+
 const IDLE_THRESHOLD_SEC = 15 * 60;
 ipcMain.handle("get-idle-state", () =>
   powerMonitor.getSystemIdleState(IDLE_THRESHOLD_SEC),
 );
 
 app.whenReady().then(() => {
+  if (!isDev) {
+    enableAutoLaunch();
+  }
+
   createWindow();
+  configureAutoUpdates();
   if (!isDev) {
     createTray();
   }
+});
+
+app.on("before-quit", (event) => {
+  clearInterval(updateCheckInterval);
+  updateCheckInterval = null;
+
+  if (app.isQuitting || hasHandledPreQuit || isCloseFlowInProgress) {
+    return;
+  }
+
+  event.preventDefault();
+  void runPreQuitFlow();
 });
 
 app.on("window-all-closed", () => {});
 
 app.on("activate", () => {
   if (mainWindow) mainWindow.show();
+});
+
+powerMonitor.on("shutdown", (event) => {
+  if (app.isQuitting || hasHandledPreQuit || isCloseFlowInProgress) {
+    return;
+  }
+
+  // Immediately write shutdown timestamp synchronously - do not wait for async operations
+  // since system power-off may not allow time for them to complete
+  store.set("pendingSessionEndAtMs", Date.now());
+  hasHandledPreQuit = true;
+
+  // Attempt graceful shutdown with timeout, but don't prevent OS shutdown
+  void runPreQuitFlow().finally(() => {
+    if (!app.isQuitting) {
+      app.quit();
+    }
+  });
 });

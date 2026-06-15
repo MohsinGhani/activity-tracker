@@ -14,9 +14,12 @@ let currentSessionId = null;
 let sessionStartTime = null;
 let sessionStartedAtMs = null;
 let elapsedBeforePauseMs = 0;
+let totalIdleMs = 0;
 let timerInterval = null;
 let screenshotTimeout = null;
 let midnightTimeout = null;
+let logoutTimeout = null;
+let sessionPersistInterval = null;
 let isIdle = false;
 let idlePollInterval = null;
 let isSessionPaused = false;
@@ -24,6 +27,8 @@ let pausedDueToIdle = false;
 let idleResumeInProgress = false;
 let todayEndedSeconds = 0;
 let isAppClosingHandled = false;
+
+const IDLE_THRESHOLD_MS = 15 * 60 * 1000;
 
 const loginView = document.getElementById("login-view");
 const dashView = document.getElementById("dashboard-view");
@@ -41,6 +46,26 @@ const todayTotalTime = document.getElementById("today-total-time");
 const toastArea = document.getElementById("toast-area");
 const logoutBtn = document.getElementById("logout-btn");
 
+window.tracker.onUpdateStatus((payload) => {
+  const status = payload?.status;
+  if (!status) return;
+
+  if (status === "available") {
+    const version = payload?.detail ? ` v${payload.detail}` : "";
+    showToast(`Update available${version}. Downloading in background.`);
+    return;
+  }
+
+  if (status === "downloaded") {
+    showToast("Update ready. It will install when you close the app.");
+    return;
+  }
+
+  if (status === "error") {
+    showToast("Update check failed. Will retry automatically.");
+  }
+});
+
 window.tracker.onAppClosing(async () => {
   if (isAppClosingHandled) {
     window.tracker.notifyAppClosingDone();
@@ -50,7 +75,12 @@ window.tracker.onAppClosing(async () => {
   isAppClosingHandled = true;
   try {
     if (currentSessionId) {
-      await endCurrentSession();
+      await persistSessionState();
+      const sessionSaved = await endCurrentSession();
+      if (sessionSaved && window.tracker.invoke) {
+        await window.tracker.invoke("session-end-confirmed");
+        console.log("Session saved and confirmed before quit");
+      }
     }
   } catch (err) {
     console.error("Failed to end session on app close:", err);
@@ -59,10 +89,33 @@ window.tracker.onAppClosing(async () => {
   }
 });
 
+window.addEventListener("beforeunload", () => {
+  if (currentSessionId) {
+    void persistSessionState();
+  }
+});
+
 onAuthChange(async (user) => {
   currentUser = user;
   if (user) {
+    if (isRecentSignIn(user)) {
+      const freshAuthTimeMs = Date.now();
+      await window.tracker.storeSet("authTimeMs", freshAuthTimeMs);
+      showDashboard(user);
+      scheduleMidnightLogout();
+      await restoreSession();
+      await refreshTodayEndedSeconds();
+      renderTodayTotalTime();
+      return;
+    }
+
+    const authTimeMs = await ensureAuthTimeMs();
+    if (await logoutIfPastMidnight(authTimeMs)) {
+      return;
+    }
+
     showDashboard(user);
+    scheduleMidnightLogout();
     await restoreSession();
     await refreshTodayEndedSeconds();
     renderTodayTotalTime();
@@ -95,6 +148,7 @@ async function handleLogin() {
 
   try {
     await loginUser(email, password);
+    await window.tracker.storeSet("authTimeMs", Date.now());
   } catch (err) {
     loginError.textContent = friendlyAuthError(err);
   } finally {
@@ -105,6 +159,7 @@ async function handleLogin() {
 
 logoutBtn.addEventListener("click", async () => {
   if (currentSessionId) await endCurrentSession();
+  await window.tracker.storeSet("authTimeMs", null);
   await logoutUser();
 });
 
@@ -118,6 +173,7 @@ startBtn.addEventListener("click", async () => {
     sessionStartTime = Date.now();
     sessionStartedAtMs = sessionStartTime;
     elapsedBeforePauseMs = 0;
+    totalIdleMs = 0;
     isSessionPaused = false;
 
     await window.tracker.storeSet("sessionId", sessionId);
@@ -125,6 +181,7 @@ startBtn.addEventListener("click", async () => {
     await window.tracker.storeSet("sessionStartedAtMs", sessionStartedAtMs);
     await window.tracker.storeSet("sessionUserId", currentUser.uid);
     await window.tracker.storeSet("sessionElapsedMs", elapsedBeforePauseMs);
+    await window.tracker.storeSet("sessionIdleMs", totalIdleMs);
     await window.tracker.storeSet("sessionPaused", false);
 
     startTimer();
@@ -156,7 +213,14 @@ async function toggleSessionState() {
 }
 
 async function pauseSession(dueToIdle = false) {
-  elapsedBeforePauseMs = getElapsedMs();
+  const elapsedAtPauseMs = getElapsedMs();
+  if (dueToIdle) {
+    const deductedIdleMs = Math.min(IDLE_THRESHOLD_MS, elapsedAtPauseMs);
+    elapsedBeforePauseMs = Math.max(0, elapsedAtPauseMs - deductedIdleMs);
+    totalIdleMs += deductedIdleMs;
+  } else {
+    elapsedBeforePauseMs = elapsedAtPauseMs;
+  }
   sessionStartTime = null;
   clearInterval(timerInterval);
   timerInterval = null;
@@ -194,21 +258,63 @@ async function resumeSession() {
 }
 
 async function endCurrentSession() {
-  if (!currentSessionId) return;
+  if (!currentSessionId) return false;
 
   const duration = Math.floor(getElapsedMs() / 1000);
+  const idleTime = Math.floor(totalIdleMs / 1000);
   const endTime = new Date();
   clearTimers();
+
+  let firebaseSaved = false;
+  try {
+    await endSession(
+      currentSessionId,
+      duration,
+      idleTime,
+      endTime,
+      getEffectiveSessionStartDate(endTime.getTime()),
+    );
+    firebaseSaved = true;
+  } catch (err) {
+    console.error("Failed to end session in Firestore:", err);
+    return false;
+  }
+
+  // Only clear if Firebase save succeeded
+  if (firebaseSaved) {
+    await clearStoredSession();
+    clearSessionState();
+    await refreshTodayEndedSeconds();
+    renderTodayTotalTime();
+    setInactiveUI();
+  }
+
+  return firebaseSaved;
+}
+
+async function recoverPendingShutdownSession(pendingEndAtMs) {
+  if (!currentSessionId || !Number.isFinite(pendingEndAtMs)) {
+    return false;
+  }
+
+  const effectiveEndAtMs = sessionStartedAtMs
+    ? Math.min(getNextMidnightMs(sessionStartedAtMs), pendingEndAtMs)
+    : pendingEndAtMs;
+  const duration = Math.floor(getElapsedMsAt(effectiveEndAtMs) / 1000);
+  const idleTime = Math.floor(totalIdleMs / 1000);
+  const endTime = new Date(effectiveEndAtMs);
 
   try {
     await endSession(
       currentSessionId,
       duration,
+      idleTime,
       endTime,
-      getEffectiveSessionStartDate(endTime.getTime()),
+      getEffectiveSessionStartDate(effectiveEndAtMs),
     );
   } catch (err) {
-    console.error("Failed to end session in Firestore:", err);
+    console.error("Failed to recover session after shutdown:", err);
+    return false;
   }
 
   await clearStoredSession();
@@ -216,6 +322,8 @@ async function endCurrentSession() {
   await refreshTodayEndedSeconds();
   renderTodayTotalTime();
   setInactiveUI();
+  showToast("Previous session was closed at the last shutdown time.");
+  return true;
 }
 
 async function restoreSession() {
@@ -223,28 +331,52 @@ async function restoreSession() {
   const startTime = await window.tracker.storeGet("sessionStartTime");
   const startedAtMs = await window.tracker.storeGet("sessionStartedAtMs");
   const userId = await window.tracker.storeGet("sessionUserId");
+  const pendingSessionEndAtMs = Number(
+    await window.tracker.storeGet("pendingSessionEndAtMs"),
+  );
+  const lastPersistedAtMs = Number(
+    await window.tracker.storeGet("sessionPersistedAtMs"),
+  );
   const elapsedMs = Number(
     (await window.tracker.storeGet("sessionElapsedMs")) ?? 0,
   );
+  const idleMs = Number((await window.tracker.storeGet("sessionIdleMs")) ?? 0);
   const paused = Boolean(await window.tracker.storeGet("sessionPaused"));
 
   if (sessionId && userId === currentUser.uid) {
     const restoredStartTime = Number(startTime);
     currentSessionId = sessionId;
     elapsedBeforePauseMs = elapsedMs;
+    totalIdleMs = Math.max(0, idleMs);
     isSessionPaused = paused;
     sessionStartTime = paused ? null : restoredStartTime;
     sessionStartedAtMs = Number.isFinite(Number(startedAtMs))
       ? Number(startedAtMs)
       : restoredStartTime;
 
+    if (pendingSessionEndAtMs) {
+      if (await recoverPendingShutdownSession(pendingSessionEndAtMs)) {
+        return;
+      }
+    } else if (
+      Number.isFinite(lastPersistedAtMs) &&
+      lastPersistedAtMs > sessionStartedAtMs
+    ) {
+      if (await recoverPendingShutdownSession(lastPersistedAtMs)) {
+        return;
+      }
+    }
+
     if (
       Number.isFinite(sessionStartedAtMs) &&
       hasCrossedMidnight(sessionStartedAtMs)
     ) {
+      await window.tracker.storeSet("pendingSessionEndAtMs", null);
       await rolloverSessionAfterMidnight();
       return;
     }
+
+    await window.tracker.storeSet("pendingSessionEndAtMs", null);
 
     if (isSessionPaused) {
       renderTimer();
@@ -258,7 +390,10 @@ async function restoreSession() {
     scheduleMidnightEnd();
     startIdlePoll();
     setActiveUI();
+    return;
   }
+
+  await window.tracker.storeSet("pendingSessionEndAtMs", null);
 }
 
 async function rolloverSessionAfterMidnight() {
@@ -266,11 +401,13 @@ async function rolloverSessionAfterMidnight() {
   const rolloverDuration = Math.floor(
     getElapsedMsAt(rolloverEndTime.getTime()) / 1000,
   );
+  const rolloverIdleTime = Math.floor(totalIdleMs / 1000);
 
   try {
     await endSession(
       currentSessionId,
       rolloverDuration,
+      rolloverIdleTime,
       rolloverEndTime,
       new Date(sessionStartedAtMs),
     );
@@ -286,6 +423,7 @@ async function rolloverSessionAfterMidnight() {
   sessionStartTime = Date.now();
   sessionStartedAtMs = sessionStartTime;
   elapsedBeforePauseMs = 0;
+  totalIdleMs = 0;
   isSessionPaused = false;
 
   await window.tracker.storeSet("sessionId", freshSessionId);
@@ -293,6 +431,7 @@ async function rolloverSessionAfterMidnight() {
   await window.tracker.storeSet("sessionStartedAtMs", sessionStartedAtMs);
   await window.tracker.storeSet("sessionUserId", currentUser.uid);
   await window.tracker.storeSet("sessionElapsedMs", elapsedBeforePauseMs);
+  await window.tracker.storeSet("sessionIdleMs", totalIdleMs);
   await window.tracker.storeSet("sessionPaused", false);
 
   startTimer();
@@ -309,6 +448,12 @@ function startTimer() {
   if (timerInterval) clearInterval(timerInterval);
   renderTimer();
   timerInterval = setInterval(renderTimer, 1000);
+  // Persist session state periodically so sudden shutdowns can be recovered
+  if (sessionPersistInterval) clearInterval(sessionPersistInterval);
+  sessionPersistInterval = setInterval(() => {
+    // best-effort, do not block UI
+    void persistSessionState();
+  }, 15 * 1000);
 }
 
 function renderTimer() {
@@ -318,6 +463,7 @@ function renderTimer() {
   const s = secs % 60;
   timerDisplay.textContent = `${pad(h)}h ${pad(m)}m ${pad(s)}s`;
   renderTodayTotalTime();
+  void persistSessionState();
 }
 
 function getLocalDayRange() {
@@ -329,6 +475,72 @@ function getLocalDayRange() {
   dayEnd.setDate(dayEnd.getDate() + 1);
 
   return { dayStart, dayEnd };
+}
+
+function isRecentSignIn(user, windowMs = 2 * 60 * 1000) {
+  const lastSignInRaw = user?.metadata?.lastSignInTime;
+  if (!lastSignInRaw) return false;
+
+  const lastSignInMs = new Date(lastSignInRaw).getTime();
+  if (!Number.isFinite(lastSignInMs)) return false;
+
+  return Date.now() - lastSignInMs <= windowMs;
+}
+
+async function ensureAuthTimeMs() {
+  const storedValue = Number(await window.tracker.storeGet("authTimeMs"));
+  if (Number.isFinite(storedValue)) {
+    return storedValue;
+  }
+
+  const authTimeMs = Date.now();
+  await window.tracker.storeSet("authTimeMs", authTimeMs);
+  return authTimeMs;
+}
+
+function clearLogoutTimer() {
+  clearTimeout(logoutTimeout);
+  logoutTimeout = null;
+}
+
+async function logoutIfPastMidnight(authTimeMs = null) {
+  if (!currentUser) return false;
+
+  const effectiveAuthTimeMs = Number.isFinite(authTimeMs)
+    ? authTimeMs
+    : Number(await window.tracker.storeGet("authTimeMs"));
+
+  if (
+    !Number.isFinite(effectiveAuthTimeMs) ||
+    !hasCrossedMidnight(effectiveAuthTimeMs)
+  ) {
+    return false;
+  }
+
+  try {
+    if (currentSessionId) {
+      await endCurrentSession();
+    }
+    await window.tracker.storeSet("authTimeMs", null);
+    await logoutUser();
+    showToast("You were logged out.");
+  } catch (err) {
+    console.error("Failed to log out user after 12:00 AM:", err);
+    showToast("Automatic logout failed. Please log out and sign in again.");
+  }
+
+  return true;
+}
+
+function scheduleMidnightLogout() {
+  clearLogoutTimer();
+  if (!currentUser) return;
+
+  const now = Date.now();
+  const delay = Math.max(0, getNextMidnightMs(now) - now);
+  logoutTimeout = setTimeout(async () => {
+    await logoutIfPastMidnight();
+  }, delay);
 }
 
 async function refreshTodayEndedSeconds() {
@@ -387,8 +599,8 @@ function pad(n) {
   return String(n).padStart(2, "0");
 }
 
-const MIN_SCREENSHOT_DELAY_MS = 8 * 60 * 1000;
-const MAX_SCREENSHOT_DELAY_MS = 10 * 60 * 1000;
+const SCREENSHOT_BLOCK_MS = 10 * 60 * 1000;
+const SCREENSHOT_BLOCK_MIN_OFFSET_MS = 1 * 60 * 1000; // start at 1 minute into each block
 
 function startIdlePoll() {
   stopIdlePoll();
@@ -433,11 +645,26 @@ function scheduleNextScreenshot() {
     screenshotTimeout = null;
     return;
   }
-  const delay =
-    MIN_SCREENSHOT_DELAY_MS +
-    Math.floor(
-      Math.random() * (MAX_SCREENSHOT_DELAY_MS - MIN_SCREENSHOT_DELAY_MS + 1),
-    );
+  const nowElapsed = getElapsedMs();
+  const blockMs = SCREENSHOT_BLOCK_MS;
+
+  // Determine which block to schedule a capture in:
+  // - If we are before the block's minimum offset, schedule within the current block.
+  // - Otherwise schedule in the next block to ensure at most one capture per block.
+  const currentBlock = Math.floor(nowElapsed / blockMs);
+  const currentBlockStart = currentBlock * blockMs;
+  const currentWindowStart = currentBlockStart + SCREENSHOT_BLOCK_MIN_OFFSET_MS;
+
+  const targetBlock =
+    nowElapsed < currentWindowStart ? currentBlock : currentBlock + 1;
+  const targetBlockStart = targetBlock * blockMs;
+  const minOffset = targetBlockStart + SCREENSHOT_BLOCK_MIN_OFFSET_MS;
+  const maxOffset = targetBlockStart + blockMs;
+
+  const randWindow = Math.max(1, maxOffset - minOffset);
+  const targetElapsed = minOffset + Math.floor(Math.random() * randWindow);
+
+  const delay = Math.max(0, targetElapsed - nowElapsed);
   screenshotTimeout = setTimeout(captureAndUpload, delay);
 }
 
@@ -701,7 +928,12 @@ function clearTimers() {
   clearTimeout(screenshotTimeout);
   screenshotTimeout = null;
   clearMidnightTimer();
+  clearLogoutTimer();
   stopIdlePoll();
+  if (sessionPersistInterval) {
+    clearInterval(sessionPersistInterval);
+    sessionPersistInterval = null;
+  }
 }
 
 function clearSessionState() {
@@ -709,6 +941,7 @@ function clearSessionState() {
   sessionStartTime = null;
   sessionStartedAtMs = null;
   elapsedBeforePauseMs = 0;
+  totalIdleMs = 0;
   isIdle = false;
   isSessionPaused = false;
   pausedDueToIdle = false;
@@ -721,14 +954,19 @@ async function clearStoredSession() {
   await window.tracker.storeSet("sessionStartedAtMs", null);
   await window.tracker.storeSet("sessionUserId", null);
   await window.tracker.storeSet("sessionElapsedMs", null);
+  await window.tracker.storeSet("sessionIdleMs", null);
   await window.tracker.storeSet("sessionPaused", null);
+  await window.tracker.storeSet("sessionPersistedAtMs", null);
+  await window.tracker.storeSet("pendingSessionEndAtMs", null);
 }
 
 async function persistSessionState() {
   await window.tracker.storeSet("sessionStartTime", sessionStartTime);
   await window.tracker.storeSet("sessionStartedAtMs", sessionStartedAtMs);
   await window.tracker.storeSet("sessionElapsedMs", elapsedBeforePauseMs);
+  await window.tracker.storeSet("sessionIdleMs", totalIdleMs);
   await window.tracker.storeSet("sessionPaused", isSessionPaused);
+  await window.tracker.storeSet("sessionPersistedAtMs", Date.now());
 }
 
 function friendlyAuthError(err) {

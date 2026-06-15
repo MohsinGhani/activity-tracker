@@ -67,11 +67,18 @@ export async function createSession(userId) {
   return docRef.id;
 }
 
-export async function endSession(sessionId, duration, endTime, startTime) {
+export async function endSession(
+  sessionId,
+  duration,
+  idleTime,
+  endTime,
+  startTime,
+) {
   return updateDoc(doc(db, "sessions", sessionId), {
     startTime,
     endTime,
     duration,
+    idleTime,
     status: "ended",
   });
 }

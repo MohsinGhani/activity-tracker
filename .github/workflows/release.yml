@@ -34,7 +34,7 @@ jobs:
           };
 
           export const cloudinaryConfig = {
-            cloudName: "dlyktw5s5",
+            cloudName: "dyrybf8v0",
             uploadPreset: "nuxt_unsigned",
           };
           "@ | Set-Content config.js
@@ -73,7 +73,7 @@ jobs:
           };
 
           export const cloudinaryConfig = {
-            cloudName: "dlyktw5s5",
+            cloudName: "dyrybf8v0",
             uploadPreset: "nuxt_unsigned",
           };
           EOF
@@ -104,7 +104,7 @@ jobs:
           };
 
           export const cloudinaryConfig = {
-            cloudName: "dlyktw5s5",
+            cloudName: "dyrybf8v0",
             uploadPreset: "nuxt_unsigned",
           };
           EOF
