@@ -108,6 +108,32 @@
       </div>
     </div>
 
+    <!-- ─── Update Banner (fixed, above all views) ───────────────── -->
+    <div
+      id="update-banner"
+      class="update-banner"
+      aria-live="polite"
+      role="status"
+    >
+      <div class="update-banner-content">
+        <div>
+          <p id="update-message" class="update-message"></p>
+          <p id="update-hint" class="update-hint"></p>
+        </div>
+        <button
+          id="update-action-btn"
+          class="btn btn-ghost"
+          type="button"
+          disabled
+        >
+          Restart & Update
+        </button>
+      </div>
+      <div class="update-progress-bar">
+        <div id="update-progress-fill" class="update-progress-fill"></div>
+      </div>
+    </div>
+
     <!-- ─── Toast Area (fixed, above both views) ────────────────── -->
     <div id="toast-area" class="toast-area" aria-live="polite"></div>
 

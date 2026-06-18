@@ -18,6 +18,7 @@ let totalIdleMs = 0;
 let timerInterval = null;
 let screenshotTimeout = null;
 let midnightTimeout = null;
+let newSessionTimeout = null;
 let logoutTimeout = null;
 let sessionPersistInterval = null;
 let isIdle = false;
@@ -29,6 +30,8 @@ let todayEndedSeconds = 0;
 let isAppClosingHandled = false;
 
 const IDLE_THRESHOLD_MS = 15 * 60 * 1000;
+const POWER_IDLE_EVENTS = new Set(["suspend", "lock-screen", "display-sleep"]);
+const POWER_ACTIVE_EVENTS = new Set(["resume", "unlock-screen", "display-on"]);
 
 const loginView = document.getElementById("login-view");
 const dashView = document.getElementById("dashboard-view");
@@ -44,7 +47,58 @@ const endBtn = document.getElementById("end-btn");
 const statusText = document.getElementById("status-text");
 const todayTotalTime = document.getElementById("today-total-time");
 const toastArea = document.getElementById("toast-area");
+const updateBanner = document.getElementById("update-banner");
+const updateMessage = document.getElementById("update-message");
+const updateHint = document.getElementById("update-hint");
+const updateProgressFill = document.getElementById("update-progress-fill");
+const updateActionBtn = document.getElementById("update-action-btn");
 const logoutBtn = document.getElementById("logout-btn");
+let updateIsReadyToInstall = false;
+
+function showUpdateBanner({ message, hint = "", percent = 0, ready = false }) {
+  updateMessage.textContent = message;
+  updateHint.textContent = hint;
+  updateProgressFill.style.width = `${Math.max(0, Math.min(100, Math.round(percent)))}%`;
+  updateIsReadyToInstall = ready;
+  updateActionBtn.disabled = !ready;
+  updateActionBtn.textContent = ready
+    ? "Restart & Update"
+    : "Downloading update…";
+  updateActionBtn.classList.toggle("btn-success", ready);
+  updateActionBtn.classList.toggle("btn-ghost", !ready);
+  updateBanner.classList.add("show");
+}
+
+function hideUpdateBanner() {
+  updateIsReadyToInstall = false;
+  updateBanner.classList.remove("show");
+  updateMessage.textContent = "";
+  updateHint.textContent = "";
+  updateProgressFill.style.width = "0%";
+  updateActionBtn.disabled = true;
+  updateActionBtn.textContent = "Restart & Update";
+  updateActionBtn.classList.remove("btn-success");
+  updateActionBtn.classList.add("btn-ghost");
+}
+
+updateActionBtn.addEventListener("click", async () => {
+  if (!updateIsReadyToInstall) return;
+
+  updateActionBtn.disabled = true;
+  updateActionBtn.textContent = "Restarting...";
+
+  try {
+    const result = await window.tracker.quitAndInstall();
+    if (!result) {
+      throw new Error("quitAndInstall failed");
+    }
+  } catch (err) {
+    console.error("Update restart failed:", err);
+    showToast("Could not restart for update. Please close the app manually.");
+    updateActionBtn.disabled = false;
+    updateActionBtn.textContent = "Restart & Update";
+  }
+});
 
 window.tracker.onUpdateStatus((payload) => {
   const status = payload?.status;
@@ -52,17 +106,77 @@ window.tracker.onUpdateStatus((payload) => {
 
   if (status === "available") {
     const version = payload?.detail ? ` v${payload.detail}` : "";
-    showToast(`Update available${version}. Downloading in background.`);
+    showUpdateBanner({
+      message: `Update${version} is available and downloading in the background.`,
+      hint: "This update will be ready to install soon.",
+      percent: 0,
+      ready: false,
+    });
+    return;
+  }
+
+  if (status === "downloading") {
+    const percent = Number(payload?.detail?.percent) || 0;
+    showUpdateBanner({
+      message: "Downloading update…",
+      hint: `${percent.toFixed(0)}% complete`,
+      percent,
+      ready: false,
+    });
     return;
   }
 
   if (status === "downloaded") {
-    showToast("Update ready. It will install when you close the app.");
+    const version = payload?.detail ? `v${payload.detail}` : "latest";
+    showUpdateBanner({
+      message: `Update ${version} downloaded and ready to install.`,
+      hint: "Click Restart & Update to apply it now.",
+      percent: 100,
+      ready: true,
+    });
+    return;
+  }
+
+  if (status === "not-available") {
+    hideUpdateBanner();
     return;
   }
 
   if (status === "error") {
+    hideUpdateBanner();
     showToast("Update check failed. Will retry automatically.");
+  }
+});
+
+window.tracker.onPowerEvent(async (eventName) => {
+  if (!currentSessionId) return;
+
+  if (POWER_IDLE_EVENTS.has(eventName)) {
+    if (!isIdle && !isSessionPaused) {
+      const idleSeconds = Number(await window.tracker.getIdleTime());
+      const idleMs = Number.isFinite(idleSeconds)
+        ? idleSeconds * 1000
+        : IDLE_THRESHOLD_MS;
+      await pauseSession(true, idleMs);
+      statusText.textContent = "Session paused (idle)";
+      showToast("Session paused — display off or system suspend.");
+    }
+    return;
+  }
+
+  if (
+    POWER_ACTIVE_EVENTS.has(eventName) &&
+    isSessionPaused &&
+    pausedDueToIdle &&
+    !idleResumeInProgress
+  ) {
+    idleResumeInProgress = true;
+    try {
+      await resumeSession();
+      showToast("Session resumed.");
+    } finally {
+      idleResumeInProgress = false;
+    }
   }
 });
 
@@ -76,7 +190,25 @@ window.tracker.onAppClosing(async () => {
   try {
     if (currentSessionId) {
       await persistSessionState();
-      const sessionSaved = await endCurrentSession();
+      // Check if this is a shutdown - use shutdown timestamp if available
+      const pendingEndAtMs = Number(
+        await window.tracker.storeGet("pendingSessionEndAtMs"),
+      );
+      let sessionSaved = false;
+
+      if (Number.isFinite(pendingEndAtMs) && pendingEndAtMs > 0) {
+        // System shutdown detected - end session at shutdown time
+        sessionSaved = await recoverPendingShutdownSession(pendingEndAtMs);
+        if (sessionSaved) {
+          console.log(
+            "Session ended at system shutdown time:",
+            new Date(pendingEndAtMs).toISOString(),
+          );
+        }
+      } else {
+        // Normal close - end session at current time
+        sessionSaved = await endCurrentSession();
+      }
       if (sessionSaved && window.tracker.invoke) {
         await window.tracker.invoke("session-end-confirmed");
         console.log("Session saved and confirmed before quit");
@@ -158,9 +290,33 @@ async function handleLogin() {
 }
 
 logoutBtn.addEventListener("click", async () => {
-  if (currentSessionId) await endCurrentSession();
-  await window.tracker.storeSet("authTimeMs", null);
-  await logoutUser();
+  try {
+    if (currentSessionId) {
+      await endCurrentSession();
+    }
+  } catch (err) {
+    console.error("Failed to finish session before logout:", err);
+  }
+
+  try {
+    await window.tracker.storeSet("authTimeMs", null);
+  } catch (err) {
+    console.error("Failed to clear auth timer on logout:", err);
+  }
+
+  try {
+    await logoutUser();
+    showToast("Logged out successfully.");
+  } catch (err) {
+    console.error("Logout failed:", err);
+    showToast("Logout failed. Please try again.");
+    return;
+  }
+
+  clearTimers();
+  clearSessionState();
+  setInactiveUI();
+  showLogin();
 });
 
 startBtn.addEventListener("click", async () => {
@@ -212,10 +368,13 @@ async function toggleSessionState() {
   await pauseSession();
 }
 
-async function pauseSession(dueToIdle = false) {
+async function pauseSession(dueToIdle = false, idleMs = null) {
   const elapsedAtPauseMs = getElapsedMs();
   if (dueToIdle) {
-    const deductedIdleMs = Math.min(IDLE_THRESHOLD_MS, elapsedAtPauseMs);
+    const requestedIdleMs = Number.isFinite(Number(idleMs))
+      ? Math.max(IDLE_THRESHOLD_MS, Number(idleMs))
+      : IDLE_THRESHOLD_MS;
+    const deductedIdleMs = Math.min(requestedIdleMs, elapsedAtPauseMs);
     elapsedBeforePauseMs = Math.max(0, elapsedAtPauseMs - deductedIdleMs);
     totalIdleMs += deductedIdleMs;
   } else {
@@ -298,7 +457,7 @@ async function recoverPendingShutdownSession(pendingEndAtMs) {
   }
 
   const effectiveEndAtMs = sessionStartedAtMs
-    ? Math.min(getNextMidnightMs(sessionStartedAtMs), pendingEndAtMs)
+    ? Math.min(getRolloverEndMs(sessionStartedAtMs), pendingEndAtMs)
     : pendingEndAtMs;
   const duration = Math.floor(getElapsedMsAt(effectiveEndAtMs) / 1000);
   const idleTime = Math.floor(totalIdleMs / 1000);
@@ -310,7 +469,7 @@ async function recoverPendingShutdownSession(pendingEndAtMs) {
       duration,
       idleTime,
       endTime,
-      getEffectiveSessionStartDate(effectiveEndAtMs),
+      getEffectiveSessionStartDateAt(effectiveEndAtMs),
     );
   } catch (err) {
     console.error("Failed to recover session after shutdown:", err);
@@ -355,16 +514,31 @@ async function restoreSession() {
       : restoredStartTime;
 
     if (pendingSessionEndAtMs) {
-      if (await recoverPendingShutdownSession(pendingSessionEndAtMs)) {
-        return;
-      }
-    } else if (
+      const endpointMs = Number.isFinite(lastPersistedAtMs)
+        ? Math.min(pendingSessionEndAtMs, lastPersistedAtMs)
+        : pendingSessionEndAtMs;
+      const recovered = await recoverPendingShutdownSession(endpointMs);
+      if (recovered) return;
+
+      showToast(
+        "Previous session pending recovery — will retry on next start.",
+      );
+      setInactiveUI();
+      return;
+    }
+
+    if (
       Number.isFinite(lastPersistedAtMs) &&
       lastPersistedAtMs > sessionStartedAtMs
     ) {
-      if (await recoverPendingShutdownSession(lastPersistedAtMs)) {
-        return;
-      }
+      const recovered = await recoverPendingShutdownSession(lastPersistedAtMs);
+      if (recovered) return;
+
+      showToast(
+        "Previous session pending recovery — will retry on next start.",
+      );
+      setInactiveUI();
+      return;
     }
 
     if (
@@ -375,8 +549,6 @@ async function restoreSession() {
       await rolloverSessionAfterMidnight();
       return;
     }
-
-    await window.tracker.storeSet("pendingSessionEndAtMs", null);
 
     if (isSessionPaused) {
       renderTimer();
@@ -397,7 +569,7 @@ async function restoreSession() {
 }
 
 async function rolloverSessionAfterMidnight() {
-  const rolloverEndTime = new Date(getNextMidnightMs(sessionStartedAtMs));
+  const rolloverEndTime = new Date(getRolloverEndMs(sessionStartedAtMs));
   const rolloverDuration = Math.floor(
     getElapsedMsAt(rolloverEndTime.getTime()) / 1000,
   );
@@ -592,7 +764,18 @@ function getElapsedMsAt(referenceMs) {
 }
 
 function getEffectiveSessionStartDate(referenceMs = Date.now()) {
+  if (Number.isFinite(sessionStartedAtMs)) {
+    return new Date(sessionStartedAtMs);
+  }
+
   return new Date(referenceMs - getElapsedMs());
+}
+
+function getEffectiveSessionStartDateAt(referenceMs) {
+  if (Number.isFinite(sessionStartedAtMs)) {
+    return new Date(sessionStartedAtMs);
+  }
+  return new Date(referenceMs - getElapsedMsAt(referenceMs));
 }
 
 function pad(n) {
@@ -612,8 +795,11 @@ function startIdlePoll() {
       !isIdle &&
       !isSessionPaused
     ) {
-      isIdle = true;
-      await pauseSession(true);
+      const idleSeconds = Number(await window.tracker.getIdleTime());
+      const idleMs = Number.isFinite(idleSeconds)
+        ? idleSeconds * 1000
+        : IDLE_THRESHOLD_MS;
+      await pauseSession(true, idleMs);
       statusText.textContent = "Session paused (idle)";
       showToast("Session paused — you are idle.");
     } else if (
@@ -630,7 +816,7 @@ function startIdlePoll() {
         idleResumeInProgress = false;
       }
     }
-  }, 30000);
+  }, 10000);
 }
 
 function stopIdlePoll() {
@@ -648,9 +834,6 @@ function scheduleNextScreenshot() {
   const nowElapsed = getElapsedMs();
   const blockMs = SCREENSHOT_BLOCK_MS;
 
-  // Determine which block to schedule a capture in:
-  // - If we are before the block's minimum offset, schedule within the current block.
-  // - Otherwise schedule in the next block to ensure at most one capture per block.
   const currentBlock = Math.floor(nowElapsed / blockMs);
   const currentBlockStart = currentBlock * blockMs;
   const currentWindowStart = currentBlockStart + SCREENSHOT_BLOCK_MIN_OFFSET_MS;
@@ -674,6 +857,24 @@ function getNextMidnightMs(referenceMs = Date.now()) {
   return nextMidnight.getTime();
 }
 
+function getNextRolloverMs(referenceMs = Date.now()) {
+  const nextRollover = new Date(referenceMs);
+  nextRollover.setHours(23, 59, 0, 0);
+  if (nextRollover.getTime() < referenceMs) {
+    nextRollover.setDate(nextRollover.getDate() + 1);
+  }
+  return nextRollover.getTime();
+}
+
+function getRolloverEndMs(startMs) {
+  const rolloverEnd = new Date(startMs);
+  rolloverEnd.setHours(23, 59, 0, 0);
+  if (rolloverEnd.getTime() < startMs) {
+    rolloverEnd.setDate(rolloverEnd.getDate() + 1);
+  }
+  return rolloverEnd.getTime();
+}
+
 function hasCrossedMidnight(startMs, referenceMs = Date.now()) {
   const startDate = new Date(startMs);
   const referenceDate = new Date(referenceMs);
@@ -694,16 +895,65 @@ function clearMidnightTimer() {
   midnightTimeout = null;
 }
 
+function scheduleNewSessionAtMidnight() {
+  clearNewSessionTimer();
+  if (!currentUser) return;
+
+  const now = Date.now();
+  const delay = Math.max(0, getNextMidnightMs(now) - now);
+  newSessionTimeout = setTimeout(async () => {
+    clearNewSessionTimer();
+    if (currentSessionId || !currentUser) return;
+
+    try {
+      const sessionId = await createSession(currentUser.uid);
+      currentSessionId = sessionId;
+      sessionStartTime = Date.now();
+      sessionStartedAtMs = sessionStartTime;
+      elapsedBeforePauseMs = 0;
+      totalIdleMs = 0;
+      isSessionPaused = false;
+
+      await window.tracker.storeSet("sessionId", sessionId);
+      await window.tracker.storeSet("sessionStartTime", sessionStartTime);
+      await window.tracker.storeSet("sessionStartedAtMs", sessionStartedAtMs);
+      await window.tracker.storeSet("sessionUserId", currentUser.uid);
+      await window.tracker.storeSet("sessionElapsedMs", elapsedBeforePauseMs);
+      await window.tracker.storeSet("sessionIdleMs", totalIdleMs);
+      await window.tracker.storeSet("sessionPaused", false);
+
+      startTimer();
+      scheduleNextScreenshot();
+      scheduleMidnightEnd();
+      startIdlePoll();
+      await refreshTodayEndedSeconds();
+      renderTodayTotalTime();
+      setActiveUI();
+      showToast("New session started at 12:00 AM.");
+    } catch (err) {
+      console.error("Failed to start new session at midnight:", err);
+      showToast("Could not start new session at 12:00 AM.");
+    }
+  }, delay);
+}
+
 function scheduleMidnightEnd() {
   clearMidnightTimer();
   if (!currentSessionId) return;
 
   const now = Date.now();
-  const delay = Math.max(0, getNextMidnightMs(now) - now);
+  const delay = Math.max(0, getNextRolloverMs(now) - now);
   midnightTimeout = setTimeout(async () => {
     if (!currentSessionId) return;
-    showToast("Session ended at 12:00 AM.");
+    if (isSessionPaused) {
+      showToast("Session ended at 11:59 PM.");
+      await endCurrentSession();
+      return;
+    }
+
+    showToast("Session ended at 11:59 PM and will restart at 12:00 AM.");
     await endCurrentSession();
+    scheduleNewSessionAtMidnight();
   }, delay);
 }
 
@@ -922,12 +1172,18 @@ function showToast(message) {
     setTimeout(() => toast.remove(), 350);
   }, 4000);
 }
+function clearNewSessionTimer() {
+  clearTimeout(newSessionTimeout);
+  newSessionTimeout = null;
+}
+
 function clearTimers() {
   clearInterval(timerInterval);
   timerInterval = null;
   clearTimeout(screenshotTimeout);
   screenshotTimeout = null;
   clearMidnightTimer();
+  clearNewSessionTimer();
   clearLogoutTimer();
   stopIdlePoll();
   if (sessionPersistInterval) {

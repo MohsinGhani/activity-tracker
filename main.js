@@ -16,6 +16,9 @@ const {
 const path = require("path");
 const Store = require("electron-store");
 const { autoUpdater } = require("electron-updater");
+const { execFile } = require("child_process");
+const util = require("util");
+const execFilePromise = util.promisify(execFile);
 
 const store = new Store();
 const isDev = !app.isPackaged;
@@ -171,6 +174,65 @@ async function runPreQuitFlow() {
   }
 }
 
+async function getMacOSWindows() {
+  try {
+    const script = `
+      set output to ""
+      tell application "System Events"
+        repeat with appProcess in (processes where background only is false)
+          set appName to name of appProcess
+          try
+            repeat with appWindow in (windows of appProcess)
+              set windowTitle to name of appWindow
+              set windowPos to position of appWindow
+              set windowSize to size of appWindow
+              set x to item 1 of windowPos
+              set y to item 2 of windowPos
+              set w to item 1 of windowSize
+              set h to item 2 of windowSize
+              set output to output & appName & "|" & windowTitle & "|" & x & "|" & y & "|" & w & "|" & h & linefeed
+            end repeat
+          end try
+        end repeat
+      end tell
+      return output
+    `;
+
+    const { stdout } = await execFilePromise("osascript", ["-e", script]);
+    const windowLines = stdout.trim().split("\n");
+
+    const windows = [];
+    for (const line of windowLines) {
+      if (!line.trim()) continue;
+      const parts = line.split("|");
+      if (parts.length === 6) {
+        try {
+          windows.push({
+            owner: {
+              name: parts[0].trim(),
+              processName: parts[0].trim(),
+            },
+            title: parts[1].trim(),
+            bounds: {
+              x: parseInt(parts[2]) || 0,
+              y: parseInt(parts[3]) || 0,
+              width: parseInt(parts[4]) || 0,
+              height: parseInt(parts[5]) || 0,
+            },
+          });
+        } catch (e) {
+          // Skip parsing errors for individual windows
+        }
+      }
+    }
+
+    return windows;
+  } catch (error) {
+    console.error("Failed to get macOS windows:", error);
+    return [];
+  }
+}
+
 async function getWindowsApi() {
   if (windowsApi) return windowsApi;
 
@@ -179,6 +241,20 @@ async function getWindowsApi() {
     windowsApi = {
       activeWindow: module.activeWindow,
       openWindows: module.openWindows,
+    };
+  } else if (process.platform === "darwin") {
+    const module = await import("active-win");
+    const getActiveWindow = module.default || module;
+    windowsApi = {
+      activeWindow: async () => getActiveWindow(),
+      openWindows: async () => {
+        try {
+          return await getMacOSWindows();
+        } catch (error) {
+          console.error("Failed to get macOS open windows:", error);
+          return [];
+        }
+      },
     };
   } else {
     const module = await import("active-win");
@@ -369,8 +445,10 @@ function enableAutoLaunch() {
   try {
     app.setLoginItemSettings({
       openAtLogin: true,
+      enabled: true,
       path: process.execPath,
       args: [],
+      openAsHidden: false,
     });
   } catch (error) {
     console.error("Failed to enable auto-launch on startup:", error);
@@ -451,10 +529,21 @@ ipcMain.handle("session-end-confirmed", () => {
   console.log("Renderer confirmed session saved to Firebase");
 });
 
+ipcMain.handle("quit-and-install", async () => {
+  try {
+    autoUpdater.quitAndInstall();
+    return true;
+  } catch (error) {
+    console.error("Failed to quit and install update:", error);
+    return false;
+  }
+});
+
 const IDLE_THRESHOLD_SEC = 15 * 60;
 ipcMain.handle("get-idle-state", () =>
   powerMonitor.getSystemIdleState(IDLE_THRESHOLD_SEC),
 );
+ipcMain.handle("get-idle-time", () => powerMonitor.getSystemIdleTime());
 
 app.whenReady().then(() => {
   if (!isDev) {
@@ -486,17 +575,32 @@ app.on("activate", () => {
   if (mainWindow) mainWindow.show();
 });
 
+function sendPowerMonitorEvent(eventName) {
+  if (!mainWindow || mainWindow.isDestroyed() || !mainWindow.webContents) {
+    return;
+  }
+  mainWindow.webContents.send("power-monitor-event", eventName);
+}
+
+for (const eventName of [
+  "suspend",
+  "resume",
+  "lock-screen",
+  "unlock-screen",
+  "display-sleep",
+  "display-on",
+]) {
+  powerMonitor.on(eventName, () => sendPowerMonitorEvent(eventName));
+}
+
 powerMonitor.on("shutdown", (event) => {
   if (app.isQuitting || hasHandledPreQuit || isCloseFlowInProgress) {
     return;
   }
 
-  // Immediately write shutdown timestamp synchronously - do not wait for async operations
-  // since system power-off may not allow time for them to complete
   store.set("pendingSessionEndAtMs", Date.now());
   hasHandledPreQuit = true;
 
-  // Attempt graceful shutdown with timeout, but don't prevent OS shutdown
   void runPreQuitFlow().finally(() => {
     if (!app.isQuitting) {
       app.quit();
