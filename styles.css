@@ -320,15 +320,22 @@ body {
   line-height: 1;
 }
 
-.today-total-card {
+.today-stats-row {
   order: 4;
   width: 100%;
+  display: flex;
+  gap: 10px;
+  margin-top: auto;
+}
+
+.today-total-card,
+.today-idle-card {
+  flex: 1;
   background: var(--bg-card);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  padding: 12px 14px;
+  padding: 12px 10px;
   text-align: center;
-  margin-top: auto;
 }
 
 .today-total-label {
@@ -340,11 +347,28 @@ body {
 }
 
 .today-total-value {
-  font-size: 20px;
+  font-size: 18px;
   font-weight: 700;
   letter-spacing: 1px;
   font-family:
     "SF Mono", "Fira Code", "Cascadia Code", "Courier New", monospace;
+}
+
+.today-idle-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  color: var(--ui-color-warning-400);
+  margin-bottom: 4px;
+}
+
+.today-idle-value {
+  font-size: 18px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  font-family:
+    "SF Mono", "Fira Code", "Cascadia Code", "Courier New", monospace;
+  color: var(--ui-color-warning-400);
 }
 
 /* ── Status Text ── */
@@ -441,6 +465,60 @@ body {
 
 #update-action-btn {
   min-width: 160px;
+}
+
+/* ─── Permission Banner ─────────────────────────────────────────────────────── */
+.permission-banner {
+  position: fixed;
+  top: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: min(520px, calc(100% - 32px));
+  display: none;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px 16px;
+  background: rgba(30, 20, 10, 0.98);
+  border: 1px solid rgba(245, 158, 11, 0.35);
+  border-radius: var(--radius);
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.4);
+  z-index: 10001;
+}
+
+.permission-banner.show {
+  display: flex;
+}
+
+.permission-banner-content {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.permission-message {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--text-primary);
+  flex: 1 1 auto;
+  min-width: 200px;
+}
+
+.permission-banner-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+#permission-action-btn {
+  min-width: 120px;
+}
+
+#permission-close-btn {
+  min-width: 80px;
 }
 
 /* ─── Toast Area ───────────────────────────────────────────────────────────── */

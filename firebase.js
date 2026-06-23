@@ -90,12 +90,19 @@ function toDateOrNull(value) {
   return Number.isNaN(parsed.getTime()) ? null : parsed;
 }
 
+export async function updateUserStatus(sessionId, status) {
+  return updateDoc(doc(db, "sessions", sessionId), {
+    status: status,
+  });
+}
+
 export async function getTodaySessionsSummary(userId, dayStart, dayEnd) {
   const q = query(collection(db, "sessions"), where("userId", "==", userId));
   const snapshot = await getDocs(q);
 
   const sessions = [];
   let totalEndedSeconds = 0;
+  let totalIdleSeconds = 0;
   const dayStartMs = dayStart.getTime();
   const dayEndMs = dayEnd.getTime();
 
@@ -114,23 +121,28 @@ export async function getTodaySessionsSummary(userId, dayStart, dayEnd) {
 
     const normalizedDuration = Math.max(0, Math.floor(duration || 0));
 
-    let endedSecondsForToday = 0;
-    if (status === "ended") {
-      // Count only the part of the session that falls inside today's local range.
-      const sessionStartMs = startDate.getTime();
-      const fallbackEndMs = sessionStartMs + normalizedDuration * 1000;
-      const sessionEndMs = endDate?.getTime() || fallbackEndMs;
-      const overlapStartMs = Math.max(sessionStartMs, dayStartMs);
-      const overlapEndMs = Math.min(sessionEndMs, dayEndMs);
-      const overlapMs = Math.max(0, overlapEndMs - overlapStartMs);
-      endedSecondsForToday = Math.floor(overlapMs / 1000);
-      totalEndedSeconds += endedSecondsForToday;
-    }
-
     const markerDate = endDate || startDate;
     const touchesToday =
       Math.min(endDate?.getTime() || startDate.getTime(), dayEndMs) >
       Math.max(startDate.getTime(), dayStartMs);
+
+    let endedSecondsForToday = 0;
+    let idleSecondsForToday = 0;
+    if (status === "ended") {
+      if (touchesToday) {
+        endedSecondsForToday = normalizedDuration;
+        totalEndedSeconds += endedSecondsForToday;
+        // Sum idle time from saved idleTime field (same date filter)
+        const sessionIdle = Math.max(
+          0,
+          Math.floor(Number(data?.idleTime ?? 0)),
+        );
+        if (Number.isFinite(sessionIdle)) {
+          idleSecondsForToday = sessionIdle;
+          totalIdleSeconds += sessionIdle;
+        }
+      }
+    }
 
     if (!markerDate && !touchesToday) return;
     if (!touchesToday && (markerDate < dayStart || markerDate >= dayEnd))
@@ -142,6 +154,7 @@ export async function getTodaySessionsSummary(userId, dayStart, dayEnd) {
       status,
       duration: normalizedDuration,
       endedSecondsForToday,
+      idleSecondsForToday,
       startTime: startDate,
       endTime: endDate,
     });
@@ -157,5 +170,6 @@ export async function getTodaySessionsSummary(userId, dayStart, dayEnd) {
     dayEnd,
     sessions,
     totalEndedSeconds: Math.max(0, totalEndedSeconds),
+    totalIdleSeconds: Math.max(0, totalIdleSeconds),
   };
 }

@@ -6,6 +6,7 @@ import {
   createSession,
   endSession,
   getTodaySessionsSummary,
+  updateUserStatus,
 } from "./firebase.js";
 import { uploadScreenshot } from "./cloudinary.js";
 
@@ -19,7 +20,6 @@ let timerInterval = null;
 let screenshotTimeout = null;
 let midnightTimeout = null;
 let newSessionTimeout = null;
-let logoutTimeout = null;
 let sessionPersistInterval = null;
 let isIdle = false;
 let idlePollInterval = null;
@@ -27,9 +27,12 @@ let isSessionPaused = false;
 let pausedDueToIdle = false;
 let idleResumeInProgress = false;
 let todayEndedSeconds = 0;
+let todayIdleSeconds = 0;
+let idleStartedAtMs = null;
 let isAppClosingHandled = false;
+let autoRestartInProgress = false;
 
-const IDLE_THRESHOLD_MS = 15 * 60 * 1000;
+const IDLE_THRESHOLD_MS = 15 * 60 * 1000; 
 const POWER_IDLE_EVENTS = new Set(["suspend", "lock-screen", "display-sleep"]);
 const POWER_ACTIVE_EVENTS = new Set(["resume", "unlock-screen", "display-on"]);
 
@@ -46,6 +49,7 @@ const stopBtn = document.getElementById("stop-btn");
 const endBtn = document.getElementById("end-btn");
 const statusText = document.getElementById("status-text");
 const todayTotalTime = document.getElementById("today-total-time");
+const todayIdleTime = document.getElementById("today-idle-time");
 const toastArea = document.getElementById("toast-area");
 const updateBanner = document.getElementById("update-banner");
 const updateMessage = document.getElementById("update-message");
@@ -53,7 +57,39 @@ const updateHint = document.getElementById("update-hint");
 const updateProgressFill = document.getElementById("update-progress-fill");
 const updateActionBtn = document.getElementById("update-action-btn");
 const logoutBtn = document.getElementById("logout-btn");
+const permissionBanner = document.getElementById("permission-banner");
+const permissionMessage = document.getElementById("permission-message");
+const permissionActionBtn = document.getElementById("permission-action-btn");
+const permissionCloseBtn = document.getElementById("permission-close-btn");
 let updateIsReadyToInstall = false;
+let permissionCheckInProgress = false;
+
+function showPermissionBanner({
+  message,
+  actionText = "Open Settings",
+  onAction,
+}) {
+  if (!permissionBanner || !permissionMessage) return;
+  permissionMessage.textContent = message;
+  if (permissionActionBtn) {
+    permissionActionBtn.textContent = actionText;
+    permissionActionBtn.style.display = "";
+    permissionActionBtn.onclick = async () => {
+      if (onAction) await onAction();
+    };
+  }
+  permissionBanner.classList.add("show");
+}
+
+function hidePermissionBanner() {
+  if (!permissionBanner) return;
+  permissionBanner.classList.remove("show");
+  if (permissionMessage) permissionMessage.textContent = "";
+  if (permissionActionBtn) {
+    permissionActionBtn.style.display = "none";
+    permissionActionBtn.onclick = null;
+  }
+}
 
 function showUpdateBanner({ message, hint = "", percent = 0, ready = false }) {
   updateMessage.textContent = message;
@@ -81,6 +117,12 @@ function hideUpdateBanner() {
   updateActionBtn.classList.add("btn-ghost");
 }
 
+if (permissionCloseBtn) {
+  permissionCloseBtn.addEventListener("click", () => {
+    hidePermissionBanner();
+  });
+}
+
 updateActionBtn.addEventListener("click", async () => {
   if (!updateIsReadyToInstall) return;
 
@@ -99,6 +141,47 @@ updateActionBtn.addEventListener("click", async () => {
     updateActionBtn.textContent = "Restart & Update";
   }
 });
+
+async function checkMacOSPermissions() {
+  if (permissionCheckInProgress) return;
+  if (process.platform !== "darwin") {
+    hidePermissionBanner();
+    return;
+  }
+
+  permissionCheckInProgress = true;
+  try {
+    const result = await window.tracker.checkPermissions();
+    const missing = [];
+    if (!result?.screenRecording) missing.push("Screen Recording");
+    if (!result?.accessibility) missing.push("Accessibility");
+    if (!result?.idleTime) missing.push("Input Monitoring");
+
+    if (missing.length > 0) {
+      showPermissionBanner({
+        message: `Missing permissions: ${missing.join(" and ")}. Click below to open System Settings and grant access so screenshots, activity tracking, and idle detection can work.`,
+        actionText: "Open Settings",
+        onAction: async () => {
+          if (!result?.screenRecording) {
+            await window.tracker.openPermissionSettings();
+          }
+          if (!result?.accessibility) {
+            await window.tracker.openAccessibilitySettings();
+          }
+          if (!result?.idleTime) {
+            await window.tracker.openInputMonitoringSettings();
+          }
+        },
+      });
+    } else {
+      hidePermissionBanner();
+    }
+  } catch (err) {
+    console.error("Permission check failed:", err);
+  } finally {
+    permissionCheckInProgress = false;
+  }
+}
 
 window.tracker.onUpdateStatus((payload) => {
   const status = payload?.status;
@@ -234,29 +317,26 @@ onAuthChange(async (user) => {
       const freshAuthTimeMs = Date.now();
       await window.tracker.storeSet("authTimeMs", freshAuthTimeMs);
       showDashboard(user);
-      scheduleMidnightLogout();
       await restoreSession();
       await refreshTodayEndedSeconds();
       renderTodayTotalTime();
+      await checkMacOSPermissions();
       return;
     }
 
     const authTimeMs = await ensureAuthTimeMs();
-    if (await logoutIfPastMidnight(authTimeMs)) {
-      return;
-    }
-
     showDashboard(user);
-    scheduleMidnightLogout();
     await restoreSession();
     await refreshTodayEndedSeconds();
     renderTodayTotalTime();
+    await checkMacOSPermissions();
   } else {
     clearTimers();
     clearSessionState();
     todayEndedSeconds = 0;
     renderTodayTotalTime();
     showLogin();
+    hidePermissionBanner();
   }
 });
 
@@ -300,8 +380,17 @@ logoutBtn.addEventListener("click", async () => {
 
   try {
     await window.tracker.storeSet("authTimeMs", null);
+    await window.tracker.storeSet("sessionId", null);
+    await window.tracker.storeSet("sessionStartTime", null);
+    await window.tracker.storeSet("sessionStartedAtMs", null);
+    await window.tracker.storeSet("sessionUserId", null);
+    await window.tracker.storeSet("sessionElapsedMs", null);
+    await window.tracker.storeSet("sessionIdleMs", null);
+    await window.tracker.storeSet("sessionPaused", null);
+    await window.tracker.storeSet("sessionPersistedAtMs", null);
+    await window.tracker.storeSet("pendingSessionEndAtMs", null);
   } catch (err) {
-    console.error("Failed to clear auth timer on logout:", err);
+    console.error("Failed to clear session state on logout:", err);
   }
 
   try {
@@ -374,11 +463,17 @@ async function pauseSession(dueToIdle = false, idleMs = null) {
     const requestedIdleMs = Number.isFinite(Number(idleMs))
       ? Math.max(IDLE_THRESHOLD_MS, Number(idleMs))
       : IDLE_THRESHOLD_MS;
-    const deductedIdleMs = Math.min(requestedIdleMs, elapsedAtPauseMs);
-    elapsedBeforePauseMs = Math.max(0, elapsedAtPauseMs - deductedIdleMs);
-    totalIdleMs += deductedIdleMs;
+    // Count idle time that triggered the pause (at least 15 min)
+    totalIdleMs += requestedIdleMs;
+    // Record when idle was first detected so we can track the full duration
+    idleStartedAtMs = Date.now();
+    elapsedBeforePauseMs = elapsedAtPauseMs;
   } else {
     elapsedBeforePauseMs = elapsedAtPauseMs;
+  }
+  // Update user status in DB
+  if (currentSessionId && dueToIdle) {
+    void updateUserStatus(currentSessionId, "idle");
   }
   sessionStartTime = null;
   clearInterval(timerInterval);
@@ -404,6 +499,15 @@ async function resumeSession() {
     return;
   }
 
+  // Calculate the full idle duration from when idle was first detected until now
+  if (idleStartedAtMs !== null && pausedDueToIdle) {
+    // Full wall-clock time the user was away
+    const fullIdleMs = Date.now() - idleStartedAtMs;
+    // Replace the initial threshold with the actual full idle duration
+    totalIdleMs = Math.max(totalIdleMs, Math.round(fullIdleMs));
+    idleStartedAtMs = null;
+  }
+
   sessionStartTime = Date.now();
   isSessionPaused = false;
   pausedDueToIdle = false;
@@ -414,12 +518,20 @@ async function resumeSession() {
   scheduleMidnightEnd();
   startIdlePoll();
   setActiveUI();
+
+  // Update user status to active in DB
+  if (currentSessionId) {
+    void updateUserStatus(currentSessionId, "active");
+  }
 }
 
 async function endCurrentSession() {
   if (!currentSessionId) return false;
 
-  const duration = Math.floor(getElapsedMs() / 1000);
+  // Duration = total elapsed time minus idle time (work time only)
+  const totalElapsedMs = getElapsedMs();
+  const workTimeMs = Math.max(0, totalElapsedMs - totalIdleMs);
+  const duration = Math.floor(workTimeMs / 1000);
   const idleTime = Math.floor(totalIdleMs / 1000);
   const endTime = new Date();
   clearTimers();
@@ -518,7 +630,11 @@ async function restoreSession() {
         ? Math.min(pendingSessionEndAtMs, lastPersistedAtMs)
         : pendingSessionEndAtMs;
       const recovered = await recoverPendingShutdownSession(endpointMs);
-      if (recovered) return;
+      if (recovered) {
+        // Auto-start new session after shutdown recovery
+        await startNewSessionAfterRecovery();
+        return;
+      }
 
       showToast(
         "Previous session pending recovery — will retry on next start.",
@@ -532,7 +648,11 @@ async function restoreSession() {
       lastPersistedAtMs > sessionStartedAtMs
     ) {
       const recovered = await recoverPendingShutdownSession(lastPersistedAtMs);
-      if (recovered) return;
+      if (recovered) {
+        // Auto-start new session after shutdown recovery
+        await startNewSessionAfterRecovery();
+        return;
+      }
 
       showToast(
         "Previous session pending recovery — will retry on next start.",
@@ -568,6 +688,39 @@ async function restoreSession() {
   await window.tracker.storeSet("pendingSessionEndAtMs", null);
 }
 
+async function startNewSessionAfterRecovery() {
+  try {
+    const sessionId = await createSession(currentUser.uid);
+    currentSessionId = sessionId;
+    sessionStartTime = Date.now();
+    sessionStartedAtMs = sessionStartTime;
+    elapsedBeforePauseMs = 0;
+    totalIdleMs = 0;
+    isSessionPaused = false;
+
+    await window.tracker.storeSet("sessionId", sessionId);
+    await window.tracker.storeSet("sessionStartTime", sessionStartTime);
+    await window.tracker.storeSet("sessionStartedAtMs", sessionStartedAtMs);
+    await window.tracker.storeSet("sessionUserId", currentUser.uid);
+    await window.tracker.storeSet("sessionElapsedMs", elapsedBeforePauseMs);
+    await window.tracker.storeSet("sessionIdleMs", totalIdleMs);
+    await window.tracker.storeSet("sessionPaused", false);
+
+    startTimer();
+    scheduleNextScreenshot();
+    scheduleMidnightEnd();
+    startIdlePoll();
+    await refreshTodayEndedSeconds();
+    renderTodayTotalTime();
+    setActiveUI();
+    showToast("New session started automatically.");
+  } catch (err) {
+    console.error("Failed to auto-start session after recovery:", err);
+    showToast("Session recovered. Please start a new session.");
+    setInactiveUI();
+  }
+}
+
 async function rolloverSessionAfterMidnight() {
   const rolloverEndTime = new Date(getRolloverEndMs(sessionStartedAtMs));
   const rolloverDuration = Math.floor(
@@ -584,7 +737,7 @@ async function rolloverSessionAfterMidnight() {
       new Date(sessionStartedAtMs),
     );
   } catch (err) {
-    console.error("Failed to close previous session at midnight:", err);
+    console.error("Failed to close previous session at rollover:", err);
   }
 
   await clearStoredSession();
@@ -613,7 +766,7 @@ async function rolloverSessionAfterMidnight() {
   await refreshTodayEndedSeconds();
   renderTodayTotalTime();
   setActiveUI();
-  showToast("Previous session ended at 12:00 AM. New session started.");
+  showToast("Previous session ended at 11:59 PM. New session started.");
 }
 
 function startTimer() {
@@ -670,54 +823,15 @@ async function ensureAuthTimeMs() {
   return authTimeMs;
 }
 
-function clearLogoutTimer() {
-  clearTimeout(logoutTimeout);
-  logoutTimeout = null;
-}
-
-async function logoutIfPastMidnight(authTimeMs = null) {
-  if (!currentUser) return false;
-
-  const effectiveAuthTimeMs = Number.isFinite(authTimeMs)
-    ? authTimeMs
-    : Number(await window.tracker.storeGet("authTimeMs"));
-
-  if (
-    !Number.isFinite(effectiveAuthTimeMs) ||
-    !hasCrossedMidnight(effectiveAuthTimeMs)
-  ) {
-    return false;
-  }
-
-  try {
-    if (currentSessionId) {
-      await endCurrentSession();
-    }
-    await window.tracker.storeSet("authTimeMs", null);
-    await logoutUser();
-    showToast("You were logged out.");
-  } catch (err) {
-    console.error("Failed to log out user after 12:00 AM:", err);
-    showToast("Automatic logout failed. Please log out and sign in again.");
-  }
-
-  return true;
-}
-
-function scheduleMidnightLogout() {
-  clearLogoutTimer();
-  if (!currentUser) return;
-
-  const now = Date.now();
-  const delay = Math.max(0, getNextMidnightMs(now) - now);
-  logoutTimeout = setTimeout(async () => {
-    await logoutIfPastMidnight();
-  }, delay);
+function clearNewSessionTimer() {
+  clearTimeout(newSessionTimeout);
+  newSessionTimeout = null;
 }
 
 async function refreshTodayEndedSeconds() {
   if (!currentUser) {
     todayEndedSeconds = 0;
+    todayIdleSeconds = 0;
     return;
   }
 
@@ -729,12 +843,14 @@ async function refreshTodayEndedSeconds() {
       dayEnd,
     );
     todayEndedSeconds = summary.totalEndedSeconds;
+    todayIdleSeconds = summary.totalIdleSeconds;
 
     console.log("Today's sessions summary", {
       date: dayStart.toLocaleDateString(),
       userId: summary.userId,
       count: summary.sessions.length,
       totalEndedSeconds: summary.totalEndedSeconds,
+      totalIdleSeconds: summary.totalIdleSeconds,
     });
   } catch (err) {
     console.error("Failed to load today's total time:", err);
@@ -743,18 +859,36 @@ async function refreshTodayEndedSeconds() {
 
 function renderTodayTotalTime() {
   if (!todayTotalTime) return;
-  const currentSessionSeconds = Math.floor(getElapsedMs() / 1000);
+  // Show work time only (excluding idle time)
+  const currentSessionWorkMs = Math.max(0, getElapsedMs() - totalIdleMs);
+  const currentSessionSeconds = Math.floor(currentSessionWorkMs / 1000);
   const totalSeconds = Math.max(0, todayEndedSeconds + currentSessionSeconds);
   const h = Math.floor(totalSeconds / 3600);
   const m = Math.floor((totalSeconds % 3600) / 60);
   const s = totalSeconds % 60;
   todayTotalTime.textContent = `${pad(h)}h ${pad(m)}m ${pad(s)}s`;
+
+  // Show idle time: completed idle (from Firebase) + current session idle
+  if (todayIdleTime) {
+    const currentIdleSeconds = Math.floor(totalIdleMs / 1000);
+    const totalIdleSecs = Math.max(0, todayIdleSeconds + currentIdleSeconds);
+    const ih = Math.floor(totalIdleSecs / 3600);
+    const im = Math.floor((totalIdleSecs % 3600) / 60);
+    const is = totalIdleSecs % 60;
+    todayIdleTime.textContent = `${pad(ih)}h ${pad(im)}m ${pad(is)}s`;
+  }
 }
 
 function getElapsedMs() {
   if (!currentSessionId) return 0;
   if (!sessionStartTime) return elapsedBeforePauseMs;
   return elapsedBeforePauseMs + (Date.now() - sessionStartTime);
+}
+
+function getWorkTimeMs() {
+  if (!currentSessionId) return 0;
+  const totalElapsed = getElapsedMs();
+  return Math.max(0, totalElapsed - totalIdleMs);
 }
 
 function getElapsedMsAt(referenceMs) {
@@ -783,38 +917,51 @@ function pad(n) {
 }
 
 const SCREENSHOT_BLOCK_MS = 10 * 60 * 1000;
-const SCREENSHOT_BLOCK_MIN_OFFSET_MS = 1 * 60 * 1000; // start at 1 minute into each block
+const SCREENSHOT_BLOCK_MIN_OFFSET_MS = 1 * 60 * 1000;
 
 function startIdlePoll() {
   stopIdlePoll();
   idlePollInterval = setInterval(async () => {
     if (!currentSessionId) return;
-    const state = await window.tracker.getIdleState();
-    if (
-      (state === "idle" || state === "locked") &&
-      !isIdle &&
-      !isSessionPaused
-    ) {
+
+    try {
+      // Get actual idle time from system
       const idleSeconds = Number(await window.tracker.getIdleTime());
-      const idleMs = Number.isFinite(idleSeconds)
-        ? idleSeconds * 1000
-        : IDLE_THRESHOLD_MS;
-      await pauseSession(true, idleMs);
-      statusText.textContent = "Session paused (idle)";
-      showToast("Session paused — you are idle.");
-    } else if (
-      state === "active" &&
-      isSessionPaused &&
-      pausedDueToIdle &&
-      !idleResumeInProgress
-    ) {
-      idleResumeInProgress = true;
-      try {
-        await resumeSession();
-        showToast("Session resumed.");
-      } finally {
-        idleResumeInProgress = false;
+      const idleMs = Number.isFinite(idleSeconds) ? idleSeconds * 1000 : 0;
+
+      // Debug logging
+      console.log("Idle check:", {
+        idleSeconds,
+        idleMs,
+        threshold: IDLE_THRESHOLD_MS,
+        isIdle,
+        isSessionPaused,
+        willPause: idleMs >= IDLE_THRESHOLD_MS && !isIdle && !isSessionPaused,
+      });
+
+      // Check if user is idle (15+ minutes)
+      if (idleMs >= IDLE_THRESHOLD_MS && !isIdle && !isSessionPaused) {
+        console.log("User is idle, pausing session");
+        await pauseSession(true, idleMs);
+        statusText.textContent = "Session paused (idle)";
+        showToast("Session paused — you are idle.");
+      } else if (
+        idleMs < IDLE_THRESHOLD_MS &&
+        isSessionPaused &&
+        pausedDueToIdle &&
+        !idleResumeInProgress
+      ) {
+        console.log("User is active, resuming session");
+        idleResumeInProgress = true;
+        try {
+          await resumeSession();
+          showToast("Session resumed.");
+        } finally {
+          idleResumeInProgress = false;
+        }
       }
+    } catch (err) {
+      console.error("Idle poll error:", err);
     }
   }, 10000);
 }
@@ -851,12 +998,6 @@ function scheduleNextScreenshot() {
   screenshotTimeout = setTimeout(captureAndUpload, delay);
 }
 
-function getNextMidnightMs(referenceMs = Date.now()) {
-  const nextMidnight = new Date(referenceMs);
-  nextMidnight.setHours(24, 0, 0, 0);
-  return nextMidnight.getTime();
-}
-
 function getNextRolloverMs(referenceMs = Date.now()) {
   const nextRollover = new Date(referenceMs);
   nextRollover.setHours(23, 59, 0, 0);
@@ -864,6 +1005,15 @@ function getNextRolloverMs(referenceMs = Date.now()) {
     nextRollover.setDate(nextRollover.getDate() + 1);
   }
   return nextRollover.getTime();
+}
+
+function getNextMidnightMs(referenceMs = Date.now()) {
+  const nextMidnight = new Date(referenceMs);
+  nextMidnight.setHours(0, 0, 0, 0);
+  if (nextMidnight.getTime() <= referenceMs) {
+    nextMidnight.setDate(nextMidnight.getDate() + 1);
+  }
+  return nextMidnight.getTime();
 }
 
 function getRolloverEndMs(startMs) {
@@ -895,7 +1045,7 @@ function clearMidnightTimer() {
   midnightTimeout = null;
 }
 
-function scheduleNewSessionAtMidnight() {
+function scheduleNewSessionAtRollover() {
   clearNewSessionTimer();
   if (!currentUser) return;
 
@@ -931,7 +1081,7 @@ function scheduleNewSessionAtMidnight() {
       setActiveUI();
       showToast("New session started at 12:00 AM.");
     } catch (err) {
-      console.error("Failed to start new session at midnight:", err);
+      console.error("Failed to start new session at rollover:", err);
       showToast("Could not start new session at 12:00 AM.");
     }
   }, delay);
@@ -948,12 +1098,13 @@ function scheduleMidnightEnd() {
     if (isSessionPaused) {
       showToast("Session ended at 11:59 PM.");
       await endCurrentSession();
+      scheduleNewSessionAtRollover();
       return;
     }
 
-    showToast("Session ended at 11:59 PM and will restart at 12:00 AM.");
+    showToast("Session ended at 11:59 PM.");
     await endCurrentSession();
-    scheduleNewSessionAtMidnight();
+    scheduleNewSessionAtRollover();
   }, delay);
 }
 
@@ -1030,6 +1181,14 @@ async function captureAndUpload() {
 
   try {
     const captureResult = await window.tracker.takeScreenshot();
+    if (
+      !captureResult ||
+      (Array.isArray(captureResult) && captureResult.length === 0)
+    ) {
+      throw new Error(
+        "Screenshot capture returned no data. Please check Screen Recording permission.",
+      );
+    }
     const capturedScreens = normalizeCapturedScreens(captureResult);
     const dataUrls = capturedScreens.map((screen) => screen.dataUrl);
 
@@ -1049,6 +1208,10 @@ async function captureAndUpload() {
     const activeContext = activityContexts?.active || {
       summary: "Unknown activity",
     };
+
+    if (activityContexts?.permissionError) {
+      await checkMacOSPermissions();
+    }
 
     const perScreenContextMap = new Map(
       (activityContexts?.perScreen || [])
@@ -1172,10 +1335,6 @@ function showToast(message) {
     setTimeout(() => toast.remove(), 350);
   }, 4000);
 }
-function clearNewSessionTimer() {
-  clearTimeout(newSessionTimeout);
-  newSessionTimeout = null;
-}
 
 function clearTimers() {
   clearInterval(timerInterval);
@@ -1184,7 +1343,6 @@ function clearTimers() {
   screenshotTimeout = null;
   clearMidnightTimer();
   clearNewSessionTimer();
-  clearLogoutTimer();
   stopIdlePoll();
   if (sessionPersistInterval) {
     clearInterval(sessionPersistInterval);
@@ -1202,6 +1360,7 @@ function clearSessionState() {
   isSessionPaused = false;
   pausedDueToIdle = false;
   idleResumeInProgress = false;
+  idleStartedAtMs = null;
 }
 
 async function clearStoredSession() {

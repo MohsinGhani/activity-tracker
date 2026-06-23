@@ -15,6 +15,12 @@ contextBridge.exposeInMainWorld("tracker", {
     ipcRenderer.invoke("show-notification", title, body),
   checkForUpdates: () => ipcRenderer.invoke("check-for-updates"),
   quitAndInstall: () => ipcRenderer.invoke("quit-and-install"),
+  checkPermissions: () => ipcRenderer.invoke("check-permissions"),
+  openPermissionSettings: () => ipcRenderer.invoke("open-permission-settings"),
+  openAccessibilitySettings: () =>
+    ipcRenderer.invoke("open-accessibility-settings"),
+  openInputMonitoringSettings: () =>
+    ipcRenderer.invoke("open-input-monitoring-settings"),
   invoke: (channel, ...args) => ipcRenderer.invoke(channel, ...args),
   onUpdateStatus: (callback) => {
     const listener = (_event, payload) => callback(payload);
@@ -30,6 +36,11 @@ contextBridge.exposeInMainWorld("tracker", {
     const listener = () => callback();
     ipcRenderer.on("app-closing", listener);
     return () => ipcRenderer.removeListener("app-closing", listener);
+  },
+  on: (channel, callback) => {
+    const listener = (_event, ...args) => callback(...args);
+    ipcRenderer.on(channel, listener);
+    return () => ipcRenderer.removeListener(channel, listener);
   },
   notifyAppClosingDone: () => ipcRenderer.send("app-closing-done"),
 });

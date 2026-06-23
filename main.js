@@ -12,6 +12,7 @@ const {
   nativeImage,
   powerMonitor,
   screen,
+  shell,
 } = require("electron");
 const path = require("path");
 const Store = require("electron-store");
@@ -455,13 +456,164 @@ function enableAutoLaunch() {
   }
 }
 
+async function checkScreenRecordingPermission() {
+  try {
+    const sources = await desktopCapturer.getSources({
+      types: ["screen"],
+      thumbnailSize: { width: 1, height: 1 },
+    });
+    return sources && sources.length > 0;
+  } catch (error) {
+    console.error("Screen recording permission check failed:", error);
+    return false;
+  }
+}
+
+async function checkAccessibilityPermission() {
+  try {
+    const script = `
+      tell application "System Events"
+        set frontApp to name of first application process whose frontmost is true
+        return frontApp
+      end tell
+    `;
+    await execFilePromise("osascript", ["-e", script]);
+    return true;
+  } catch (error) {
+    console.error("Accessibility permission check failed:", error);
+    return false;
+  }
+}
+
+async function checkIdleTimePermission() {
+  try {
+    // On macOS, getSystemIdleTime() returns 0 without Input Monitoring permission
+    // Take multiple samples to verify it's actually working
+    const samples = [];
+    for (let i = 0; i < 3; i++) {
+      const idleTime = powerMonitor.getSystemIdleTime();
+      samples.push(idleTime);
+      if (idleTime > 0) {
+        // Got a non-zero reading, permission is working
+        return true;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+
+    // All samples returned 0 - likely a permission issue on macOS
+    const allZero = samples.every((s) => s === 0);
+    if (allZero && process.platform === "darwin") {
+      console.error(
+        "Idle time returns 0 on macOS - Input Monitoring permission may be missing",
+      );
+      return false;
+    }
+
+    // On Windows and Linux, always return true (we have our own detection or it works)
+    return true;
+  } catch (error) {
+    console.error("Idle time permission check failed:", error);
+    return false;
+  }
+}
+
+async function getWindowsIdleTime() {
+  try {
+    // Use PowerShell to get idle time on Windows using GetLastInputInfo
+    const script = `
+      Add-Type @"
+      using System;
+      using System.Runtime.InteropServices;
+      public struct LASTINPUTINFO {
+        public uint cbSize;
+        public uint dwTime;
+      }
+      public class IdleTime {
+        [DllImport("user32.dll")]
+        public static extern bool GetLastInputInfo(ref LASTINPUTINFO plii);
+        public static uint GetIdleTime() {
+          LASTINPUTINFO info = new LASTINPUTINFO();
+          info.cbSize = (uint)Marshal.SizeOf(info);
+          if (GetLastInputInfo(ref info)) {
+            return ((uint)Environment.TickCount - info.dwTime);
+          }
+          return 0;
+        }
+      }
+"@
+      [IdleTime]::GetIdleTime()
+    `;
+
+    const result = await execFilePromise("powershell.exe", [
+      "-Command",
+      script,
+    ]);
+
+    const idleMs = parseInt(result.stdout.trim()) || 0;
+    return Math.floor(idleMs / 1000);
+  } catch (error) {
+    console.error("Failed to get Windows idle time:", error);
+    return 0;
+  }
+}
+
+ipcMain.handle("check-permissions", async () => {
+  const screenRecording = await checkScreenRecordingPermission();
+  const accessibility = await checkAccessibilityPermission();
+  const idleTime = await checkIdleTimePermission();
+  return {
+    screenRecording,
+    accessibility,
+    idleTime,
+    platform: process.platform,
+  };
+});
+
+ipcMain.handle("open-permission-settings", async () => {
+  if (process.platform === "darwin") {
+    try {
+      await shell.openExternal(
+        "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
+      );
+    } catch (error) {
+      console.error("Failed to open screen recording settings:", error);
+    }
+  }
+});
+
+ipcMain.handle("open-accessibility-settings", async () => {
+  if (process.platform === "darwin") {
+    try {
+      await shell.openExternal(
+        "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+      );
+    } catch (error) {
+      console.error("Failed to open accessibility settings:", error);
+    }
+  }
+});
+
+ipcMain.handle("open-input-monitoring-settings", async () => {
+  if (process.platform === "darwin") {
+    try {
+      await shell.openExternal(
+        "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent",
+      );
+    } catch (error) {
+      console.error("Failed to open input monitoring settings:", error);
+    }
+  }
+});
+
 ipcMain.handle("take-screenshot", async () => {
   const sources = await desktopCapturer.getSources({
     types: ["screen"],
     thumbnailSize: { width: 3840, height: 2160 },
   });
   if (!sources || sources.length === 0)
-    throw new Error("No screen sources available");
+    throw new Error(
+      "No screen sources available. Please grant Screen Recording permission in System Settings > Privacy & Security > Screen Recording.",
+    );
 
   return sources.map((s, index) => {
     const fallbackName = `Screen ${index + 1}`;
@@ -481,14 +633,27 @@ ipcMain.handle("get-activity-contexts", async (_event, displayIds = []) => {
     return await buildPerScreenActivityContext(displayIds);
   } catch (error) {
     console.error("Failed to read per-screen activity context:", error);
+    const isPermissionError =
+      process.platform === "darwin" &&
+      (error?.message?.includes("not allowed") ||
+        error?.message?.includes("permission") ||
+        error?.message?.includes("Accessibility") ||
+        error?.code === "EACCES");
+
     return {
       active: {
-        summary: "Unknown activity",
-        appName: "Unknown app",
-        windowTitle: "Unknown window",
+        summary: isPermissionError
+          ? "Activity tracking unavailable — grant Accessibility permission"
+          : "Unknown activity",
+        appName: isPermissionError ? "Permission required" : "Unknown app",
+        windowTitle: isPermissionError
+          ? "Open System Settings > Privacy & Security > Accessibility"
+          : "Unknown window",
         fileName: null,
+        permissionError: isPermissionError,
       },
       perScreen: [],
+      permissionError: isPermissionError,
     };
   }
 });
@@ -500,11 +665,23 @@ ipcMain.handle("get-activity-context", async () => {
     return buildActivityContext(activeWindow);
   } catch (error) {
     console.error("Failed to read active window context:", error);
+    const isPermissionError =
+      process.platform === "darwin" &&
+      (error?.message?.includes("not allowed") ||
+        error?.message?.includes("permission") ||
+        error?.message?.includes("Accessibility") ||
+        error?.code === "EACCES");
+
     return {
-      summary: "Unknown activity",
-      appName: "Unknown app",
-      windowTitle: "Unknown window",
+      summary: isPermissionError
+        ? "Activity tracking unavailable — grant Accessibility permission"
+        : "Unknown activity",
+      appName: isPermissionError ? "Permission required" : "Unknown app",
+      windowTitle: isPermissionError
+        ? "Open System Settings > Privacy & Security > Accessibility"
+        : "Unknown window",
       fileName: null,
+      permissionError: isPermissionError,
     };
   }
 });
@@ -543,7 +720,26 @@ const IDLE_THRESHOLD_SEC = 15 * 60;
 ipcMain.handle("get-idle-state", () =>
   powerMonitor.getSystemIdleState(IDLE_THRESHOLD_SEC),
 );
-ipcMain.handle("get-idle-time", () => powerMonitor.getSystemIdleTime());
+ipcMain.handle("get-idle-time", async () => {
+  let idleSeconds;
+
+  if (process.platform === "win32") {
+    // Use Windows-specific idle time detection
+    idleSeconds = await getWindowsIdleTime();
+  } else {
+    // Use Electron's built-in idle time detection for macOS and Linux
+    idleSeconds = powerMonitor.getSystemIdleTime();
+  }
+
+  console.log(
+    "[IDLE DEBUG] Idle time:",
+    idleSeconds,
+    "seconds (platform:",
+    process.platform,
+    ")",
+  );
+  return idleSeconds;
+});
 
 app.whenReady().then(() => {
   if (!isDev) {

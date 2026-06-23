@@ -39,7 +39,7 @@
         </div>
 
         <div class="form-group">
-          <label for="email">Email</label>
+          <label for="email">Email :</label>
           <input
             type="email"
             id="email"
@@ -50,7 +50,7 @@
         </div>
 
         <div class="form-group">
-          <label for="password">Password</label>
+          <label for="password">Password :</label>
           <input
             type="password"
             id="password"
@@ -102,9 +102,15 @@
           End Session
         </button>
       </div>
-      <div class="today-total-card">
-        <p class="today-total-label">Today's Total Time</p>
-        <p id="today-total-time" class="today-total-value">00h 00m 00s</p>
+      <div class="today-stats-row">
+        <div class="today-total-card">
+          <p class="today-total-label">Today's Active Time</p>
+          <p id="today-total-time" class="today-total-value">00h 00m 00s</p>
+        </div>
+        <div class="today-idle-card">
+          <p class="today-idle-label">Today's Idle Time</p>
+          <p id="today-idle-time" class="today-idle-value">00h 00m 00s</p>
+        </div>
       </div>
     </div>
 
@@ -131,6 +137,32 @@
       </div>
       <div class="update-progress-bar">
         <div id="update-progress-fill" class="update-progress-fill"></div>
+      </div>
+    </div>
+
+    <!-- ─── Permission Banner (fixed, above all views) ──────────── -->
+    <div
+      id="permission-banner"
+      class="permission-banner"
+      aria-live="polite"
+      role="alert"
+    >
+      <div class="permission-banner-content">
+        <div>
+          <p id="permission-message" class="permission-message"></p>
+        </div>
+        <div class="permission-banner-actions">
+          <button
+            id="permission-action-btn"
+            class="btn btn-primary"
+            type="button"
+          >
+            Open Settings
+          </button>
+          <button id="permission-close-btn" class="btn btn-ghost" type="button">
+            Dismiss
+          </button>
+        </div>
       </div>
     </div>
 
