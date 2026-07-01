@@ -78,6 +78,7 @@ jobs:
           };
           EOF
       - run: npm ci
+      - run: npm install dmg-license
       - run: npx electron-builder install-app-deps
       - run: npm run dist:mac
         env:
