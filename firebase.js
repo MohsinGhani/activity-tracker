@@ -4,9 +4,12 @@ import {
   signInWithEmailAndPassword,
   signOut,
   onAuthStateChanged,
+  setPersistence,
+  browserLocalPersistence,
+  browserSessionPersistence,
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
 import {
-  getFirestore,
+  initializeFirestore,
   collection,
   addDoc,
   doc,
@@ -21,9 +24,33 @@ import { firebaseConfig } from "./config.js";
 const firebaseApp = initializeApp(firebaseConfig);
 
 export const auth = getAuth(firebaseApp);
-export const db = getFirestore(firebaseApp);
+// Firestore's default WebChannel transport can hang indefinitely (never
+// resolving, never rejecting) inside Electron's file:// renderer — reads
+// (one-shot GETs) often succeed while writes/streams wedge forever. FORCING
+// long-polling (rather than auto-detecting it, which can itself stall in
+// Electron) is the established fix. useFetchStreams:false avoids a separate
+// fetch-based streaming path that is also unreliable in Electron.
+export const db = initializeFirestore(firebaseApp, {
+  experimentalForceLongPolling: true,
+  useFetchStreams: false,
+});
 
-export function loginUser(email, password) {
+// Choose how long the Firebase session survives. Local persistence (IndexedDB)
+// keeps the user signed in across app restarts ("Remember me"); session
+// persistence clears the login when the app closes.
+export async function setAuthPersistence(remember) {
+  try {
+    await setPersistence(
+      auth,
+      remember ? browserLocalPersistence : browserSessionPersistence,
+    );
+  } catch (error) {
+    console.error("Failed to set auth persistence:", error);
+  }
+}
+
+export async function loginUser(email, password, remember = true) {
+  await setAuthPersistence(remember);
   return signInWithEmailAndPassword(auth, email, password);
 }
 
