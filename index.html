@@ -59,6 +59,11 @@
           />
         </div>
 
+        <label class="remember-row" for="remember-me">
+          <input type="checkbox" id="remember-me" checked />
+          <span>Remember me</span>
+        </label>
+
         <p id="login-error" class="error-msg" aria-live="polite"></p>
 
         <button id="login-btn" class="btn btn-primary">Login</button>
@@ -111,6 +116,16 @@
           <p class="today-idle-label">Today's Idle Time</p>
           <p id="today-idle-time" class="today-idle-value">00h 00m 00s</p>
         </div>
+      </div>
+
+      <div id="diagnostics" class="diagnostics" role="alert" hidden>
+        <div class="diagnostics-body">
+          <p class="diagnostics-label">Last error</p>
+          <p id="diagnostics-text" class="diagnostics-text"></p>
+        </div>
+        <button id="open-log-btn" class="btn btn-ghost" type="button">
+          Open log
+        </button>
       </div>
     </div>
 

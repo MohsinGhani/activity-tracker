@@ -163,6 +163,24 @@ body {
   text-align: center;
 }
 
+.remember-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+  font-size: 13px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  user-select: none;
+}
+
+.remember-row input[type="checkbox"] {
+  width: 15px;
+  height: 15px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
 /* ─── Buttons ──────────────────────────────────────────────────────────────── */
 .btn {
   display: inline-flex;
@@ -555,4 +573,50 @@ body {
 .toast.visible {
   opacity: 1;
   transform: translateY(0);
+}
+
+/* ─── Diagnostics (last error) ─────────────────────────────────────────────── */
+.diagnostics {
+  order: 5;
+  width: 100%;
+  margin-top: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 12px;
+  background: rgba(228, 59, 0, 0.08);
+  border: 1px solid rgba(228, 59, 0, 0.35);
+  border-left: 3px solid var(--danger);
+  border-radius: var(--radius);
+}
+
+.diagnostics[hidden] {
+  display: none;
+}
+
+.diagnostics-body {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.diagnostics-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  color: var(--error-color);
+  margin: 0 0 2px;
+}
+
+.diagnostics-text {
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--text-primary);
+  margin: 0;
+  word-break: break-word;
+}
+
+.diagnostics #open-log-btn {
+  flex-shrink: 0;
+  min-width: 88px;
 }

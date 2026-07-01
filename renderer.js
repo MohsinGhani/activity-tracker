@@ -61,6 +61,10 @@ const permissionBanner = document.getElementById("permission-banner");
 const permissionMessage = document.getElementById("permission-message");
 const permissionActionBtn = document.getElementById("permission-action-btn");
 const permissionCloseBtn = document.getElementById("permission-close-btn");
+const rememberCheckbox = document.getElementById("remember-me");
+const diagnostics = document.getElementById("diagnostics");
+const diagnosticsText = document.getElementById("diagnostics-text");
+const openLogBtn = document.getElementById("open-log-btn");
 let updateIsReadyToInstall = false;
 let permissionCheckInProgress = false;
 
@@ -123,6 +127,83 @@ if (permissionCloseBtn) {
   });
 }
 
+function showDiagnostic(message, at = new Date().toISOString()) {
+  if (!diagnostics || !diagnosticsText || !message) return;
+  const time = new Date(at).toLocaleTimeString("en-US", {
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: true,
+  });
+  diagnosticsText.textContent = `${message} — ${time}`;
+  diagnostics.hidden = false;
+}
+
+function hideDiagnostic() {
+  if (!diagnostics) return;
+  diagnostics.hidden = true;
+  if (diagnosticsText) diagnosticsText.textContent = "";
+}
+
+function friendlyScreenshotError(err) {
+  const msg = (err?.message || String(err || "")).trim();
+  if (/permission|not allowed|screen recording|no screen sources/i.test(msg)) {
+    return "Screen Recording permission issue — see the banner above.";
+  }
+  if (/cloudinary|upload/i.test(msg)) {
+    return `Upload failed: ${msg}`;
+  }
+  if (/network|fetch|ENOTFOUND|ETIMEDOUT|ECONN/i.test(msg)) {
+    return "Network error while uploading the screenshot.";
+  }
+  return msg || "Unknown screenshot error.";
+}
+
+if (openLogBtn) {
+  openLogBtn.addEventListener("click", async () => {
+    try {
+      await window.tracker.openLogFile();
+    } catch (err) {
+      console.error("Failed to open log file:", err);
+    }
+  });
+}
+
+if (window.tracker.onDiagnostic) {
+  window.tracker.onDiagnostic((payload) => {
+    if (!payload?.message) return;
+    showDiagnostic(friendlyScreenshotError({ message: payload.message }), payload.at);
+  });
+}
+
+// Global safety net: an unexpected throw in an async UI handler must never
+// leave a control stuck (e.g. Start frozen on "Starting…") or fail silently.
+// Log it durably to tracker.log and reset any in-flight button.
+function resetStuckButtons() {
+  try {
+    if (!currentSessionId && startBtn && startBtn.disabled) {
+      startBtn.disabled = false;
+      startBtn.textContent = "▶ Start Session";
+    }
+  } catch (_) {}
+}
+
+window.addEventListener("unhandledrejection", (event) => {
+  const msg = event?.reason?.message || String(event?.reason || "unknown");
+  console.error("Unhandled rejection:", event?.reason);
+  void window.tracker.logEvent?.("unhandledrejection", msg);
+  try {
+    showDiagnostic(`Unexpected error: ${msg}`);
+  } catch (_) {}
+  resetStuckButtons();
+});
+
+window.addEventListener("error", (event) => {
+  const msg = event?.error?.message || event?.message || "unknown";
+  console.error("Uncaught error:", event?.error || event?.message);
+  void window.tracker.logEvent?.("uncaught-error", msg);
+  resetStuckButtons();
+});
+
 updateActionBtn.addEventListener("click", async () => {
   if (!updateIsReadyToInstall) return;
 
@@ -142,24 +223,65 @@ updateActionBtn.addEventListener("click", async () => {
   }
 });
 
+function getMissingPermissions(result) {
+  // Only gate on permissions that are (a) actually required and (b) reliably
+  // detectable. Screen Recording (screenshots + window titles) and
+  // Accessibility (active app/window detection) qualify. Input Monitoring is
+  // intentionally NOT gated: powerMonitor.getSystemIdleTime() does not require
+  // it on macOS, and probing it via idle-time samples false-positives whenever
+  // the user is active (idle time == 0) — e.g. at the exact moment they click
+  // Start — which would wrongly block starting a session.
+  const missing = [];
+  if (!result?.screenRecording) missing.push("Screen Recording");
+  if (!result?.accessibility) missing.push("Accessibility");
+  return missing;
+}
+
+// Client-side backstop: main.js already times out each native permission
+// check internally, but this guarantees the UI recovers even if the IPC
+// round-trip itself never comes back, so the Start button can never freeze
+// on "Starting…" forever.
+function withTimeout(promise, ms, fallbackValue) {
+  return Promise.race([
+    promise,
+    new Promise((resolve) => setTimeout(() => resolve(fallbackValue), ms)),
+  ]);
+}
+
 async function checkMacOSPermissions() {
-  if (permissionCheckInProgress) return;
-  if (process.platform !== "darwin") {
+  if (permissionCheckInProgress) return null;
+  if (window.tracker.platform !== "darwin") {
     hidePermissionBanner();
-    return;
+    return { screenRecording: true, accessibility: true, idleTime: true, missing: [] };
   }
 
   permissionCheckInProgress = true;
   try {
-    const result = await window.tracker.checkPermissions();
-    const missing = [];
-    if (!result?.screenRecording) missing.push("Screen Recording");
-    if (!result?.accessibility) missing.push("Accessibility");
-    if (!result?.idleTime) missing.push("Input Monitoring");
+    const result = await withTimeout(
+      window.tracker.checkPermissions(),
+      12000,
+      null,
+    );
+    if (result === null) {
+      console.error("Permission check timed out");
+      return { timedOut: true, missing: [] };
+    }
+    const missing = getMissingPermissions(result);
 
-    if (missing.length > 0) {
+    if (result?.needsRelaunch) {
+      // Screen Recording is granted at the OS level but won't work until the
+      // app is relaunched — offer a one-click relaunch instead of Settings.
       showPermissionBanner({
-        message: `Missing permissions: ${missing.join(" and ")}. Click below to open System Settings and grant access so screenshots, activity tracking, and idle detection can work.`,
+        message:
+          "Screen Recording was granted but needs an app relaunch to take effect. Relaunch now so screenshots and activity tracking work.",
+        actionText: "Relaunch now",
+        onAction: async () => {
+          await window.tracker.relaunchApp();
+        },
+      });
+    } else if (missing.length > 0) {
+      showPermissionBanner({
+        message: `Missing permissions: ${missing.join(" and ")}. Click below to open System Settings and grant access so screenshots and activity tracking can work.`,
         actionText: "Open Settings",
         onAction: async () => {
           if (!result?.screenRecording) {
@@ -168,16 +290,16 @@ async function checkMacOSPermissions() {
           if (!result?.accessibility) {
             await window.tracker.openAccessibilitySettings();
           }
-          if (!result?.idleTime) {
-            await window.tracker.openInputMonitoringSettings();
-          }
         },
       });
     } else {
       hidePermissionBanner();
     }
+
+    return { ...result, missing };
   } catch (err) {
     console.error("Permission check failed:", err);
+    return null;
   } finally {
     permissionCheckInProgress = false;
   }
@@ -348,6 +470,7 @@ passInput.addEventListener("keydown", (e) => {
 async function handleLogin() {
   const email = emailInput.value.trim();
   const password = passInput.value;
+  const remember = rememberCheckbox ? rememberCheckbox.checked : true;
 
   if (!email || !password) {
     loginError.textContent = "Please enter your email and password.";
@@ -359,8 +482,11 @@ async function handleLogin() {
   loginBtn.textContent = "Logging in\u2026";
 
   try {
-    await loginUser(email, password);
+    await loginUser(email, password, remember);
     await window.tracker.storeSet("authTimeMs", Date.now());
+    // Persist the preference and the email only \u2014 never the password.
+    await window.tracker.storeSet("rememberMe", remember);
+    await window.tracker.storeSet("savedEmail", remember ? email : null);
   } catch (err) {
     loginError.textContent = friendlyAuthError(err);
   } finally {
@@ -411,9 +537,65 @@ logoutBtn.addEventListener("click", async () => {
 startBtn.addEventListener("click", async () => {
   startBtn.disabled = true;
   startBtn.textContent = "Starting\u2026";
+  void window.tracker.logEvent?.("start", "Start clicked");
+
+  // Never start a session on macOS unless all required permissions are
+  // granted. checkMacOSPermissions() also shows the right banner (relaunch
+  // prompt or Settings links) as a side effect, and is guarded against
+  // hanging forever (client + main-process timeouts).
+  if (window.tracker.platform === "darwin") {
+    void window.tracker.logEvent?.("start", "checking permissions\u2026");
+    const perm = await checkMacOSPermissions();
+    void window.tracker.logEvent?.(
+      "start",
+      `permissions result: ${JSON.stringify(perm)}`,
+    );
+    if (!perm || perm.timedOut) {
+      showToast(
+        perm?.timedOut
+          ? "Permission check timed out \u2014 please try again."
+          : "Could not verify permissions \u2014 please try again.",
+      );
+      startBtn.disabled = false;
+      startBtn.textContent = "\u25b6 Start Session";
+      return;
+    }
+    if (perm.needsRelaunch || perm.missing.length > 0) {
+      showToast(
+        perm.needsRelaunch
+          ? "Relaunch required before starting \u2014 see the banner above."
+          : `Can't start \u2014 grant: ${perm.missing.join(", ")}.`,
+      );
+      startBtn.disabled = false;
+      startBtn.textContent = "\u25b6 Start Session";
+      return;
+    }
+  }
 
   try {
-    const sessionId = await createSession(currentUser.uid);
+    void window.tracker.logEvent?.(
+      "start",
+      "permissions OK \u2014 calling createSession (Firestore write)\u2026",
+    );
+    const SESSION_TIMEOUT = Symbol("session-timeout");
+    const sessionId = await withTimeout(
+      createSession(currentUser.uid),
+      15000,
+      SESSION_TIMEOUT,
+    );
+    if (sessionId === SESSION_TIMEOUT) {
+      void window.tracker.logEvent?.(
+        "start",
+        "createSession TIMED OUT after 15s (Firestore write wedged)",
+      );
+      throw new Error(
+        "Starting a session timed out \u2014 the server took too long to respond. Check your network connection (firewall/VPN/proxy) and try again.",
+      );
+    }
+    void window.tracker.logEvent?.(
+      "start",
+      `createSession returned id=${sessionId}`,
+    );
     currentSessionId = sessionId;
     sessionStartTime = Date.now();
     sessionStartedAtMs = sessionStartTime;
@@ -437,7 +619,9 @@ startBtn.addEventListener("click", async () => {
     setActiveUI();
   } catch (err) {
     console.error("Failed to start session:", err);
-    showToast("Could not start session \u2014 check the console.");
+    const friendly = err?.message || "check the console.";
+    showToast(`Could not start session \u2014 ${friendly}`);
+    showDiagnostic(friendly);
     startBtn.disabled = false;
     startBtn.textContent = "\u25B6 Start Session";
   }
@@ -690,7 +874,15 @@ async function restoreSession() {
 
 async function startNewSessionAfterRecovery() {
   try {
-    const sessionId = await createSession(currentUser.uid);
+    const RECOVERY_TIMEOUT = Symbol("session-timeout");
+    const sessionId = await withTimeout(
+      createSession(currentUser.uid),
+      15000,
+      RECOVERY_TIMEOUT,
+    );
+    if (sessionId === RECOVERY_TIMEOUT) {
+      throw new Error("Starting the recovered session timed out.");
+    }
     currentSessionId = sessionId;
     sessionStartTime = Date.now();
     sessionStartedAtMs = sessionStartTime;
@@ -1056,7 +1248,15 @@ function scheduleNewSessionAtRollover() {
     if (currentSessionId || !currentUser) return;
 
     try {
-      const sessionId = await createSession(currentUser.uid);
+      const ROLLOVER_TIMEOUT = Symbol("session-timeout");
+      const sessionId = await withTimeout(
+        createSession(currentUser.uid),
+        15000,
+        ROLLOVER_TIMEOUT,
+      );
+      if (sessionId === ROLLOVER_TIMEOUT) {
+        throw new Error("Starting the rollover session timed out.");
+      }
       currentSessionId = sessionId;
       sessionStartTime = Date.now();
       sessionStartedAtMs = sessionStartTime;
@@ -1209,7 +1409,7 @@ async function captureAndUpload() {
       summary: "Unknown activity",
     };
 
-    if (activityContexts?.permissionError) {
+    if (activityContexts?.permissionError || activityContexts?.needsRelaunch) {
       await checkMacOSPermissions();
     }
 
@@ -1251,6 +1451,7 @@ async function captureAndUpload() {
     });
 
     const activityText = combinedSummary ? ` (${combinedSummary})` : "";
+    hideDiagnostic();
     showToast(`Screenshot captured at ${timeStr}${activityText}`);
     await window.tracker.showNotification(
       "Team Tracker",
@@ -1258,7 +1459,19 @@ async function captureAndUpload() {
     );
   } catch (err) {
     console.error("Screenshot capture/upload failed:", err);
-    showToast("Screenshot failed \u2014 will retry next interval.");
+    const friendly = friendlyScreenshotError(err);
+    showToast(`Screenshot failed: ${friendly}`);
+    showDiagnostic(friendly);
+    // If it looks like a Screen Recording problem, surface the banner too so
+    // the user can grant access or relaunch.
+    if (
+      window.tracker.platform === "darwin" &&
+      /permission|not allowed|screen recording|no screen sources/i.test(
+        err?.message || "",
+      )
+    ) {
+      await checkMacOSPermissions();
+    }
   } finally {
     scheduleNextScreenshot();
   }
@@ -1273,9 +1486,24 @@ function showDashboard(user) {
 function showLogin() {
   dashView.classList.remove("active");
   loginView.classList.add("active");
-  emailInput.value = "";
   passInput.value = "";
   loginError.textContent = "";
+  void prefillRememberedEmail();
+}
+
+async function prefillRememberedEmail() {
+  try {
+    const stored = await window.tracker.storeGet("rememberMe");
+    // Default to "on" until the user explicitly opts out, so sessions persist
+    // and users don't have to sign in every day.
+    const remembered = stored == null ? true : Boolean(stored);
+    const savedEmail = await window.tracker.storeGet("savedEmail");
+    if (rememberCheckbox) rememberCheckbox.checked = remembered;
+    emailInput.value = remembered && savedEmail ? savedEmail : "";
+  } catch (err) {
+    console.error("Failed to prefill remembered email:", err);
+    emailInput.value = "";
+  }
 }
 
 function setActiveUI() {

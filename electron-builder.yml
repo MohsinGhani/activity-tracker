@@ -43,7 +43,14 @@ mac:
     - dmg
     - zip
   icon: assets/icon.icns
-  hardenedRuntime: true
+  # Hardened runtime enforces library validation, which makes the app refuse to
+  # spawn/load the ad-hoc-signed active-win native helper (node_modules/active-win/main
+  # and its Swift dylibs) — breaking active-app/window detection ("Unknown activity").
+  # For ad-hoc / non-notarized builds it must be off. If you later notarize with a
+  # real Developer ID, set this back to true AND add an entitlements plist granting
+  # com.apple.security.cs.disable-library-validation (+ entitlementsInherit) so the
+  # helper can still load.
+  hardenedRuntime: false
 
 linux:
   target:

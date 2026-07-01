@@ -3,6 +3,10 @@
 const { contextBridge, ipcRenderer } = require("electron");
 
 contextBridge.exposeInMainWorld("tracker", {
+  // The renderer is context-isolated (no Node `process`), so surface the
+  // platform here where Node globals are available. renderer.js must use
+  // window.tracker.platform instead of process.platform.
+  platform: process.platform,
   takeScreenshot: () => ipcRenderer.invoke("take-screenshot"),
   getActivityContexts: (displayIds) =>
     ipcRenderer.invoke("get-activity-contexts", displayIds),
@@ -21,6 +25,18 @@ contextBridge.exposeInMainWorld("tracker", {
     ipcRenderer.invoke("open-accessibility-settings"),
   openInputMonitoringSettings: () =>
     ipcRenderer.invoke("open-input-monitoring-settings"),
+  relaunchApp: () => ipcRenderer.invoke("relaunch-app"),
+  getLastError: () => ipcRenderer.invoke("get-last-error"),
+  readRecentLog: (maxLines) =>
+    ipcRenderer.invoke("read-recent-log", maxLines),
+  openLogFile: () => ipcRenderer.invoke("open-log-file"),
+  logEvent: (scope, message) =>
+    ipcRenderer.invoke("log-event", scope, message),
+  onDiagnostic: (callback) => {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on("diagnostic", listener);
+    return () => ipcRenderer.removeListener("diagnostic", listener);
+  },
   invoke: (channel, ...args) => ipcRenderer.invoke(channel, ...args),
   onUpdateStatus: (callback) => {
     const listener = (_event, payload) => callback(payload);
