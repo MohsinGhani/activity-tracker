@@ -32,7 +32,7 @@ let idleStartedAtMs = null;
 let isAppClosingHandled = false;
 let autoRestartInProgress = false;
 
-const IDLE_THRESHOLD_MS = 15 * 60 * 1000; 
+const IDLE_THRESHOLD_MS = 15 * 60 * 1000;
 const POWER_IDLE_EVENTS = new Set(["suspend", "lock-screen", "display-sleep"]);
 const POWER_ACTIVE_EVENTS = new Set(["resume", "unlock-screen", "display-on"]);
 
@@ -171,7 +171,10 @@ if (openLogBtn) {
 if (window.tracker.onDiagnostic) {
   window.tracker.onDiagnostic((payload) => {
     if (!payload?.message) return;
-    showDiagnostic(friendlyScreenshotError({ message: payload.message }), payload.at);
+    showDiagnostic(
+      friendlyScreenshotError({ message: payload.message }),
+      payload.at,
+    );
   });
 }
 
@@ -252,7 +255,12 @@ async function checkMacOSPermissions() {
   if (permissionCheckInProgress) return null;
   if (window.tracker.platform !== "darwin") {
     hidePermissionBanner();
-    return { screenRecording: true, accessibility: true, idleTime: true, missing: [] };
+    return {
+      screenRecording: true,
+      accessibility: true,
+      idleTime: true,
+      missing: [],
+    };
   }
 
   permissionCheckInProgress = true;
@@ -709,7 +717,7 @@ async function resumeSession() {
   }
 }
 
-async function endCurrentSession() {
+async function endCurrentSession(endTimeMs = null) {
   if (!currentSessionId) return false;
 
   // Duration = total elapsed time minus idle time (work time only)
@@ -717,7 +725,12 @@ async function endCurrentSession() {
   const workTimeMs = Math.max(0, totalElapsedMs - totalIdleMs);
   const duration = Math.floor(workTimeMs / 1000);
   const idleTime = Math.floor(totalIdleMs / 1000);
-  const endTime = new Date();
+  const endTime = endTimeMs ? new Date(endTimeMs) : new Date();
+
+  console.log(
+    `[Session End Details] Duration: ${duration}s, Idle: ${idleTime}s, End Time: ${endTime.toISOString()} (${endTime.toLocaleTimeString()})`,
+  );
+
   clearTimers();
 
   let firebaseSaved = false;
@@ -730,8 +743,14 @@ async function endCurrentSession() {
       getEffectiveSessionStartDate(endTime.getTime()),
     );
     firebaseSaved = true;
+    console.log(
+      `[Session End Success] Session ${currentSessionId} successfully saved to Firestore.`,
+    );
   } catch (err) {
-    console.error("Failed to end session in Firestore:", err);
+    console.error(
+      "[Session End Error] Failed to end session in Firestore:",
+      err,
+    );
     return false;
   }
 
@@ -1192,8 +1211,8 @@ function scheduleNextScreenshot() {
 
 function getNextRolloverMs(referenceMs = Date.now()) {
   const nextRollover = new Date(referenceMs);
-  nextRollover.setHours(23, 59, 0, 0);
-  if (nextRollover.getTime() < referenceMs) {
+  nextRollover.setHours(23, 59, 59, 999);
+  if (nextRollover.getTime() <= referenceMs) {
     nextRollover.setDate(nextRollover.getDate() + 1);
   }
   return nextRollover.getTime();
@@ -1202,7 +1221,7 @@ function getNextRolloverMs(referenceMs = Date.now()) {
 function getNextMidnightMs(referenceMs = Date.now()) {
   const nextMidnight = new Date(referenceMs);
   nextMidnight.setHours(0, 0, 0, 0);
-  if (nextMidnight.getTime() <= referenceMs) {
+  if (nextMidnight.getTime() < referenceMs) {
     nextMidnight.setDate(nextMidnight.getDate() + 1);
   }
   return nextMidnight.getTime();
@@ -1210,7 +1229,7 @@ function getNextMidnightMs(referenceMs = Date.now()) {
 
 function getRolloverEndMs(startMs) {
   const rolloverEnd = new Date(startMs);
-  rolloverEnd.setHours(23, 59, 0, 0);
+  rolloverEnd.setHours(23, 59, 59, 999);
   if (rolloverEnd.getTime() < startMs) {
     rolloverEnd.setDate(rolloverEnd.getDate() + 1);
   }
@@ -1237,17 +1256,39 @@ function clearMidnightTimer() {
   midnightTimeout = null;
 }
 
-function scheduleNewSessionAtRollover() {
+function scheduleNewSessionAtRollover(targetTimeMs = null) {
   clearNewSessionTimer();
   if (!currentUser) return;
 
   const now = Date.now();
-  const delay = Math.max(0, getNextMidnightMs(now) - now);
+  // Use passed target time or calculate from current time
+  const midnightTime = targetTimeMs || getNextMidnightMs(now);
+  const delay = Math.max(0, midnightTime - now);
+
+  console.log(
+    `[New Session Scheduled] Starting at: ${new Date(midnightTime).toISOString()}, delay: ${delay}ms`,
+  );
+
   newSessionTimeout = setTimeout(async () => {
     clearNewSessionTimer();
-    if (currentSessionId || !currentUser) return;
+
+    // IMPORTANT: Force clear old session ID to ensure new session can start
+    if (currentSessionId) {
+      console.log(
+        `[New Session] WARNING: Clearing leftover sessionId: ${currentSessionId}`,
+      );
+      currentSessionId = null;
+    }
+
+    if (!currentUser) {
+      console.log("[New Session] Skipped - user logged out.");
+      return;
+    }
 
     try {
+      console.log(
+        `[New Session] Creating new session at: ${new Date().toISOString()} (${new Date().toLocaleTimeString()})`,
+      );
       const ROLLOVER_TIMEOUT = Symbol("session-timeout");
       const sessionId = await withTimeout(
         createSession(currentUser.uid),
@@ -1279,10 +1320,19 @@ function scheduleNewSessionAtRollover() {
       await refreshTodayEndedSeconds();
       renderTodayTotalTime();
       setActiveUI();
+      console.log(`[New Session] Successfully created session: ${sessionId}`);
       showToast("New session started at 12:00 AM.");
     } catch (err) {
-      console.error("Failed to start new session at rollover:", err);
+      console.error(
+        "[New Session Error] Failed to start new session at rollover:",
+        err,
+      );
       showToast("Could not start new session at 12:00 AM.");
+      // Retry in 5 seconds if failed
+      newSessionTimeout = setTimeout(
+        () => scheduleNewSessionAtRollover(),
+        5000,
+      );
     }
   }, delay);
 }
@@ -1292,19 +1342,55 @@ function scheduleMidnightEnd() {
   if (!currentSessionId) return;
 
   const now = Date.now();
-  const delay = Math.max(0, getNextRolloverMs(now) - now);
+  const rolloverTime = getNextRolloverMs(now);
+  const delay = Math.max(0, rolloverTime - now);
+
+  // Calculate new session time (12:00 AM next day)
+  const newSessionTime = new Date(rolloverTime);
+  newSessionTime.setHours(0, 0, 0, 0);
+  newSessionTime.setDate(newSessionTime.getDate() + 1);
+  const newSessionTimeMs = newSessionTime.getTime();
+
   midnightTimeout = setTimeout(async () => {
     if (!currentSessionId) return;
-    if (isSessionPaused) {
-      showToast("Session ended at 11:59 PM.");
-      await endCurrentSession();
-      scheduleNewSessionAtRollover();
-      return;
+
+    // Check if user is active or session is live before ending
+    const isUserActive = !isIdle && !isSessionPaused;
+    const isSessionLive = currentSessionId && !isSessionPaused;
+
+    console.log(
+      `[Midnight Check] User Active: ${isUserActive}, Session Live: ${isSessionLive}, Session Paused: ${isSessionPaused}`,
+    );
+
+    // End current session at exactly 11:59:59 PM
+    const endTime = new Date(rolloverTime);
+    console.log(
+      `[Session End] Ending session at: ${endTime.toISOString()} (${endTime.toLocaleTimeString()})`,
+    );
+
+    if (isSessionLive) {
+      try {
+        const success = await endCurrentSession(rolloverTime);
+        if (success) {
+          showToast("Session ended at 11:59:59 PM.");
+          console.log(
+            "[Session End] Session successfully ended at rollover time.",
+          );
+        } else {
+          console.error("[Session End] Failed to end session at rollover.");
+          showToast("Warning: Could not end session at 11:59 PM.");
+        }
+      } catch (err) {
+        console.error("[Session End] Error ending session:", err);
+        showToast("Error ending session at 11:59 PM.");
+      }
     }
 
-    showToast("Session ended at 11:59 PM.");
-    await endCurrentSession();
-    scheduleNewSessionAtRollover();
+    // Schedule new session to start at exactly 12:00 AM (next day)
+    console.log(
+      `[Session End] Now scheduling new session to start at 12:00 AM...`,
+    );
+    scheduleNewSessionAtRollover(newSessionTimeMs);
   }, delay);
 }
 
