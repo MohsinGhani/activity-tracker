@@ -178,9 +178,6 @@ if (window.tracker.onDiagnostic) {
   });
 }
 
-// Global safety net: an unexpected throw in an async UI handler must never
-// leave a control stuck (e.g. Start frozen on "Starting…") or fail silently.
-// Log it durably to tracker.log and reset any in-flight button.
 function resetStuckButtons() {
   try {
     if (!currentSessionId && startBtn && startBtn.disabled) {
@@ -227,23 +224,12 @@ updateActionBtn.addEventListener("click", async () => {
 });
 
 function getMissingPermissions(result) {
-  // Only gate on permissions that are (a) actually required and (b) reliably
-  // detectable. Screen Recording (screenshots + window titles) and
-  // Accessibility (active app/window detection) qualify. Input Monitoring is
-  // intentionally NOT gated: powerMonitor.getSystemIdleTime() does not require
-  // it on macOS, and probing it via idle-time samples false-positives whenever
-  // the user is active (idle time == 0) — e.g. at the exact moment they click
-  // Start — which would wrongly block starting a session.
   const missing = [];
   if (!result?.screenRecording) missing.push("Screen Recording");
   if (!result?.accessibility) missing.push("Accessibility");
   return missing;
 }
 
-// Client-side backstop: main.js already times out each native permission
-// check internally, but this guarantees the UI recovers even if the IPC
-// round-trip itself never comes back, so the Start button can never freeze
-// on "Starting…" forever.
 function withTimeout(promise, ms, fallbackValue) {
   return Promise.race([
     promise,
@@ -277,8 +263,6 @@ async function checkMacOSPermissions() {
     const missing = getMissingPermissions(result);
 
     if (result?.needsRelaunch) {
-      // Screen Recording is granted at the OS level but won't work until the
-      // app is relaunched — offer a one-click relaunch instead of Settings.
       showPermissionBanner({
         message:
           "Screen Recording was granted but needs an app relaunch to take effect. Relaunch now so screenshots and activity tracking work.",
@@ -370,23 +354,17 @@ window.tracker.onPowerEvent(async (eventName) => {
       const idleMs = Number.isFinite(idleSeconds)
         ? idleSeconds * 1000
         : IDLE_THRESHOLD_MS;
-      await pauseSession(true, idleMs);
-      statusText.textContent = "Session paused (idle)";
-      showToast("Session paused — display off or system suspend.");
+      enterIdleMode(idleMs);
+      showToast("Session idle detected — time will be excluded from duration.");
     }
     return;
   }
 
-  if (
-    POWER_ACTIVE_EVENTS.has(eventName) &&
-    isSessionPaused &&
-    pausedDueToIdle &&
-    !idleResumeInProgress
-  ) {
+  if (POWER_ACTIVE_EVENTS.has(eventName) && isIdle && !idleResumeInProgress) {
     idleResumeInProgress = true;
     try {
-      await resumeSession();
-      showToast("Session resumed.");
+      exitIdleMode();
+      showToast("Session active again.");
     } finally {
       idleResumeInProgress = false;
     }
@@ -547,10 +525,6 @@ startBtn.addEventListener("click", async () => {
   startBtn.textContent = "Starting\u2026";
   void window.tracker.logEvent?.("start", "Start clicked");
 
-  // Never start a session on macOS unless all required permissions are
-  // granted. checkMacOSPermissions() also shows the right banner (relaunch
-  // prompt or Settings links) as a side effect, and is guarded against
-  // hanging forever (client + main-process timeouts).
   if (window.tracker.platform === "darwin") {
     void window.tracker.logEvent?.("start", "checking permissions\u2026");
     const perm = await checkMacOSPermissions();
@@ -636,7 +610,9 @@ startBtn.addEventListener("click", async () => {
 });
 
 stopBtn.addEventListener("click", toggleSessionState);
-endBtn.addEventListener("click", endCurrentSession);
+endBtn.addEventListener("click", () => {
+  void endCurrentSession();
+});
 
 async function toggleSessionState() {
   if (!currentSessionId) return;
@@ -650,6 +626,9 @@ async function toggleSessionState() {
 }
 
 async function pauseSession(dueToIdle = false, idleMs = null) {
+  if (isIdle) {
+    exitIdleMode();
+  }
   const elapsedAtPauseMs = getElapsedMs();
   if (dueToIdle) {
     const requestedIdleMs = Number.isFinite(Number(idleMs))
@@ -722,10 +701,19 @@ async function endCurrentSession(endTimeMs = null) {
 
   // Duration = total elapsed time minus idle time (work time only)
   const totalElapsedMs = getElapsedMs();
-  const workTimeMs = Math.max(0, totalElapsedMs - totalIdleMs);
+  const trackedIdleMs = getTrackedIdleMs();
+  const workTimeMs = Math.max(0, totalElapsedMs - trackedIdleMs);
   const duration = Math.floor(workTimeMs / 1000);
-  const idleTime = Math.floor(totalIdleMs / 1000);
-  const endTime = endTimeMs ? new Date(endTimeMs) : new Date();
+  const idleTime = Math.floor(trackedIdleMs / 1000);
+  const candidateEndTime =
+    typeof endTimeMs === "number" || typeof endTimeMs === "string"
+      ? new Date(endTimeMs)
+      : endTimeMs instanceof Date
+        ? new Date(endTimeMs.getTime())
+        : new Date();
+  const endTime = Number.isNaN(candidateEndTime.getTime())
+    ? new Date()
+    : candidateEndTime;
 
   console.log(
     `[Session End Details] Duration: ${duration}s, Idle: ${idleTime}s, End Time: ${endTime.toISOString()} (${endTime.toLocaleTimeString()})`,
@@ -834,7 +822,6 @@ async function restoreSession() {
         : pendingSessionEndAtMs;
       const recovered = await recoverPendingShutdownSession(endpointMs);
       if (recovered) {
-        // Auto-start new session after shutdown recovery
         await startNewSessionAfterRecovery();
         return;
       }
@@ -1071,7 +1058,8 @@ async function refreshTodayEndedSeconds() {
 function renderTodayTotalTime() {
   if (!todayTotalTime) return;
   // Show work time only (excluding idle time)
-  const currentSessionWorkMs = Math.max(0, getElapsedMs() - totalIdleMs);
+  const trackedIdleMs = getTrackedIdleMs();
+  const currentSessionWorkMs = Math.max(0, getElapsedMs() - trackedIdleMs);
   const currentSessionSeconds = Math.floor(currentSessionWorkMs / 1000);
   const totalSeconds = Math.max(0, todayEndedSeconds + currentSessionSeconds);
   const h = Math.floor(totalSeconds / 3600);
@@ -1081,12 +1069,59 @@ function renderTodayTotalTime() {
 
   // Show idle time: completed idle (from Firebase) + current session idle
   if (todayIdleTime) {
-    const currentIdleSeconds = Math.floor(totalIdleMs / 1000);
+    const currentIdleSeconds = Math.floor(trackedIdleMs / 1000);
     const totalIdleSecs = Math.max(0, todayIdleSeconds + currentIdleSeconds);
     const ih = Math.floor(totalIdleSecs / 3600);
     const im = Math.floor((totalIdleSecs % 3600) / 60);
     const is = totalIdleSecs % 60;
     todayIdleTime.textContent = `${pad(ih)}h ${pad(im)}m ${pad(is)}s`;
+  }
+}
+
+function getCurrentIdleMs(referenceMs = Date.now()) {
+  if (!isIdle || !Number.isFinite(idleStartedAtMs)) return 0;
+  return Math.max(0, referenceMs - idleStartedAtMs);
+}
+
+function getTrackedIdleMs(referenceMs = Date.now()) {
+  return Math.max(0, totalIdleMs + getCurrentIdleMs(referenceMs));
+}
+
+function enterIdleMode(observedIdleMs = IDLE_THRESHOLD_MS) {
+  if (!currentSessionId || isSessionPaused || isIdle) return;
+  const normalizedIdleMs = Number.isFinite(Number(observedIdleMs))
+    ? Math.max(IDLE_THRESHOLD_MS, Number(observedIdleMs))
+    : IDLE_THRESHOLD_MS;
+
+  isIdle = true;
+  idleStartedAtMs = Date.now() - normalizedIdleMs;
+  statusText.textContent = "Session active (idle detected)";
+  statusText.className = "status-text active";
+  renderTodayTotalTime();
+  void persistSessionState();
+
+  if (currentSessionId) {
+    void updateUserStatus(currentSessionId, "idle");
+  }
+}
+
+function exitIdleMode() {
+  if (!isIdle) return;
+
+  totalIdleMs = getTrackedIdleMs();
+  isIdle = false;
+  idleStartedAtMs = null;
+
+  if (!isSessionPaused) {
+    statusText.textContent = "Session active";
+    statusText.className = "status-text active";
+  }
+
+  renderTodayTotalTime();
+  void persistSessionState();
+
+  if (currentSessionId && !isSessionPaused) {
+    void updateUserStatus(currentSessionId, "active");
   }
 }
 
@@ -1099,7 +1134,7 @@ function getElapsedMs() {
 function getWorkTimeMs() {
   if (!currentSessionId) return 0;
   const totalElapsed = getElapsedMs();
-  return Math.max(0, totalElapsed - totalIdleMs);
+  return Math.max(0, totalElapsed - getTrackedIdleMs());
 }
 
 function getElapsedMsAt(referenceMs) {
@@ -1152,21 +1187,19 @@ function startIdlePoll() {
 
       // Check if user is idle (15+ minutes)
       if (idleMs >= IDLE_THRESHOLD_MS && !isIdle && !isSessionPaused) {
-        console.log("User is idle, pausing session");
-        await pauseSession(true, idleMs);
-        statusText.textContent = "Session paused (idle)";
-        showToast("Session paused — you are idle.");
+        console.log("User is idle, tracking idle time without pausing session");
+        enterIdleMode(idleMs);
+        showToast("Session idle detected — time excluded from duration.");
       } else if (
         idleMs < IDLE_THRESHOLD_MS &&
-        isSessionPaused &&
-        pausedDueToIdle &&
+        isIdle &&
         !idleResumeInProgress
       ) {
-        console.log("User is active, resuming session");
+        console.log("User is active, ending idle state");
         idleResumeInProgress = true;
         try {
-          await resumeSession();
-          showToast("Session resumed.");
+          exitIdleMode();
+          showToast("Session active again.");
         } finally {
           idleResumeInProgress = false;
         }
@@ -1180,7 +1213,6 @@ function startIdlePoll() {
 function stopIdlePoll() {
   clearInterval(idlePollInterval);
   idlePollInterval = null;
-  isIdle = false;
 }
 
 function scheduleNextScreenshot() {
@@ -1345,7 +1377,6 @@ function scheduleMidnightEnd() {
   const rolloverTime = getNextRolloverMs(now);
   const delay = Math.max(0, rolloverTime - now);
 
-  // Calculate new session time (12:00 AM next day)
   const newSessionTime = new Date(rolloverTime);
   newSessionTime.setHours(0, 0, 0, 0);
   newSessionTime.setDate(newSessionTime.getDate() + 1);
@@ -1354,21 +1385,21 @@ function scheduleMidnightEnd() {
   midnightTimeout = setTimeout(async () => {
     if (!currentSessionId) return;
 
-    // Check if user is active or session is live before ending
+    const wasPausedAtRollover = isSessionPaused;
+
     const isUserActive = !isIdle && !isSessionPaused;
-    const isSessionLive = currentSessionId && !isSessionPaused;
+    const hasSessionToEnd = Boolean(currentSessionId);
 
     console.log(
       `[Midnight Check] User Active: ${isUserActive}, Session Live: ${isSessionLive}, Session Paused: ${isSessionPaused}`,
     );
 
-    // End current session at exactly 11:59:59 PM
     const endTime = new Date(rolloverTime);
     console.log(
       `[Session End] Ending session at: ${endTime.toISOString()} (${endTime.toLocaleTimeString()})`,
     );
 
-    if (isSessionLive) {
+    if (hasSessionToEnd) {
       try {
         const success = await endCurrentSession(rolloverTime);
         if (success) {
@@ -1386,7 +1417,14 @@ function scheduleMidnightEnd() {
       }
     }
 
-    // Schedule new session to start at exactly 12:00 AM (next day)
+    if (wasPausedAtRollover) {
+      console.log(
+        "[Session End] Session was paused at rollover; skipping 12:00 AM auto-start.",
+      );
+      showToast("Paused session ended at 11:59 PM. No new session started.");
+      return;
+    }
+
     console.log(
       `[Session End] Now scheduling new session to start at 12:00 AM...`,
     );
@@ -1403,11 +1441,13 @@ function loadImage(url) {
   });
 }
 
+const SCREENSHOT_UPLOAD_MIME_TYPE = "image/webp";
+const SCREENSHOT_UPLOAD_QUALITY = 0.8;
+
 async function stitchScreenshots(dataUrls) {
   if (!Array.isArray(dataUrls) || dataUrls.length === 0) {
     throw new Error("No screenshot data received");
   }
-  if (dataUrls.length === 1) return dataUrls[0];
 
   const images = await Promise.all(dataUrls.map(loadImage));
 
@@ -1418,6 +1458,9 @@ async function stitchScreenshots(dataUrls) {
   canvas.width = totalWidth;
   canvas.height = maxHeight;
   const ctx = canvas.getContext("2d");
+  if (!ctx) {
+    throw new Error("Failed to prepare screenshot canvas");
+  }
 
   let x = 0;
   for (const img of images) {
@@ -1425,7 +1468,10 @@ async function stitchScreenshots(dataUrls) {
     x += img.naturalWidth;
   }
 
-  return canvas.toDataURL("image/png");
+  return canvas.toDataURL(
+    SCREENSHOT_UPLOAD_MIME_TYPE,
+    SCREENSHOT_UPLOAD_QUALITY,
+  );
 }
 
 function normalizeCapturedScreens(captureResult) {
@@ -1693,7 +1739,7 @@ async function persistSessionState() {
   await window.tracker.storeSet("sessionStartTime", sessionStartTime);
   await window.tracker.storeSet("sessionStartedAtMs", sessionStartedAtMs);
   await window.tracker.storeSet("sessionElapsedMs", elapsedBeforePauseMs);
-  await window.tracker.storeSet("sessionIdleMs", totalIdleMs);
+  await window.tracker.storeSet("sessionIdleMs", getTrackedIdleMs());
   await window.tracker.storeSet("sessionPaused", isSessionPaused);
   await window.tracker.storeSet("sessionPersistedAtMs", Date.now());
 }
