@@ -985,7 +985,7 @@ ipcMain.handle("session-end-confirmed", () => {
 
 ipcMain.handle("quit-and-install", async () => {
   try {
-    autoUpdater.quitAndInstall(true, true);
+    autoUpdater.quitAndInstall();
     return true;
   } catch (error) {
     console.error("Failed to quit and install update:", error);
