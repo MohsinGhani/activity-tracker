@@ -1,0 +1,23 @@
+# One command:  docker compose up -d --build
+# Then open:    http://localhost:6080/vnc.html?autoconnect=1&resize=scale
+name: activity-tracker
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: activity-tracker:latest
+    container_name: activity-tracker-app
+    ports:
+      - "6080:6080"
+    shm_size: "1gb"
+    volumes:
+      - .:/app                              # live source (restart container to reload)
+      - node_modules:/app/node_modules      # Linux deps, kept separate from Windows ones
+      - userdata:/home/node/.config         # login / electron-store / logs persist
+    restart: unless-stopped
+
+volumes:
+  node_modules:
+  userdata:
