@@ -78,3 +78,18 @@ stay counted as active.
 npm install
 npm start
 ```
+
+## Running in Docker (virtual desktop)
+
+```bash
+docker compose up -d --build
+```
+
+Then open <http://localhost:6080/vnc.html?autoconnect=1&resize=scale> to use the
+app in your browser. It runs on a virtual Linux desktop inside the container,
+so screenshots and active-window tracking capture **that** desktop, not your
+real one. It still connects to the real Firebase/Cloudinary from `config.js`.
+
+- Stop: `docker compose down`
+- Reload after code changes: `docker compose restart app`
+- Logs: `docker compose logs -f app`
