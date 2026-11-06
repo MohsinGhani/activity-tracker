@@ -2,7 +2,7 @@
 
 An Electron desktop app that tracks work sessions with periodic screenshots,
 active-app/window detection, and idle detection. Auth and storage are backed by
-Firebase; screenshots are uploaded to Cloudinary.
+Firebase; screenshots are uploaded to a private Amazon S3 bucket.
 
 ## Requirements (macOS)
 

@@ -62,10 +62,11 @@ export function onAuthChange(callback) {
   return onAuthStateChanged(auth, callback);
 }
 
+// `image` = where the files live, e.g. { storage: "s3", s3Path }.
 export async function saveScreenshot(
   sessionId,
   userId,
-  imageUrl,
+  image,
   timestamp,
   activityContext = {},
 ) {
@@ -76,7 +77,7 @@ export async function saveScreenshot(
   const screenshotDoc = {
     sessionId,
     userId,
-    imageUrl,
+    ...image,
     timestamp,
     activitySummary: activityContext.summary || "Unknown activity",
     createdAt: serverTimestamp(),

@@ -20,25 +20,6 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Write client config
-        run: |
-          @"
-          export const firebaseConfig = {
-            apiKey: "AIzaSyDphA090liCwD1C6TDPfjZrZFewnk5Z3yI",
-            authDomain: "employee-management-8cb26.firebaseapp.com",
-            projectId: "employee-management-8cb26",
-            storageBucket: "employee-management-8cb26.firebasestorage.app",
-            messagingSenderId: "241361442701",
-            appId: "1:241361442701:web:b6b3c26265636382868fc4",
-            measurementId: "G-6QSGNVYT4Q",
-          };
-
-          export const cloudinaryConfig = {
-            cloudName: "dyrybf8v0",
-            uploadPreset: "nuxt_unsigned",
-          };
-          "@ | Set-Content config.js
-
       - run: npm ci
         env:
           PYTHON: python
@@ -59,24 +40,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - name: Write client config
-        run: |
-          cat <<EOF > config.js
-          export const firebaseConfig = {
-            apiKey: "AIzaSyDphA090liCwD1C6TDPfjZrZFewnk5Z3yI",
-            authDomain: "employee-management-8cb26.firebaseapp.com",
-            projectId: "employee-management-8cb26",
-            storageBucket: "employee-management-8cb26.firebasestorage.app",
-            messagingSenderId: "241361442701",
-            appId: "1:241361442701:web:b6b3c26265636382868fc4",
-            measurementId: "G-6QSGNVYT4Q",
-          };
-
-          export const cloudinaryConfig = {
-            cloudName: "dyrybf8v0",
-            uploadPreset: "nuxt_unsigned",
-          };
-          EOF
       - run: npm ci
       - run: npm install dmg-license
       - run: npx electron-builder install-app-deps
@@ -91,24 +54,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - name: Write client config
-        run: |
-          cat <<EOF > config.js
-          export const firebaseConfig = {
-            apiKey: "AIzaSyDphA090liCwD1C6TDPfjZrZFewnk5Z3yI",
-            authDomain: "employee-management-8cb26.firebaseapp.com",
-            projectId: "employee-management-8cb26",
-            storageBucket: "employee-management-8cb26.firebasestorage.app",
-            messagingSenderId: "241361442701",
-            appId: "1:241361442701:web:b6b3c26265636382868fc4",
-            measurementId: "G-6QSGNVYT4Q",
-          };
-
-          export const cloudinaryConfig = {
-            cloudName: "dyrybf8v0",
-            uploadPreset: "nuxt_unsigned",
-          };
-          EOF
       - run: npm ci
       - run: npx electron-builder install-app-deps
       - run: npm run dist:linux

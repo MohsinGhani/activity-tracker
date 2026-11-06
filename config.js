@@ -8,7 +8,9 @@ export const firebaseConfig = {
   measurementId: "G-6QSGNVYT4Q",
 };
 
-export const cloudinaryConfig = {
-  cloudName: "dlyktw5s5",
-  uploadPreset: "nuxt_unsigned",
+// Screenshots: private S3 bucket, written with Cognito credentials (no secrets).
+export const s3Config = {
+  region: "eu-west-2",
+  bucket: "activity-tracker-screenshots-941399479989",
+  identityPoolId: "eu-west-2:2f60d5cb-19d4-4e9b-8012-da241133f599",
 };

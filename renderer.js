@@ -8,7 +8,7 @@ import {
   getTodaySessionsSummary,
   updateUserStatus,
 } from "./firebase.js";
-import { uploadScreenshot } from "./cloudinary.js";
+import { uploadScreenshot } from "./screenshotStorage.js";
 
 let currentUser = null;
 let currentSessionId = null;
@@ -152,7 +152,7 @@ function friendlyScreenshotError(err) {
   if (/permission|not allowed|screen recording|no screen sources/i.test(msg)) {
     return "Screen Recording permission issue — see the banner above.";
   }
-  if (/cloudinary|upload/i.test(msg)) {
+  if (/upload/i.test(msg)) {
     return `Upload failed: ${msg}`;
   }
   if (/network|fetch|ENOTFOUND|ETIMEDOUT|ECONN/i.test(msg)) {
@@ -1465,37 +1465,58 @@ function loadImage(url) {
   });
 }
 
-const SCREENSHOT_UPLOAD_MIME_TYPE = "image/webp";
-const SCREENSHOT_UPLOAD_QUALITY = 0.8;
+// Each screenshot is stored in three sizes. Heights are per monitor, so a
+// multi-monitor capture keeps every screen readable. `height: null` = the
+// monitor's real size.
+const SCREENSHOT_VERSIONS = [
+  { name: "thumb", height: 169, quality: 0.5 },
+  { name: "std", height: 720, quality: 0.6 },
+  { name: "full", height: null, quality: 0.8 },
+];
 
-async function stitchScreenshots(dataUrls) {
-  if (!Array.isArray(dataUrls) || dataUrls.length === 0) {
+// Stitches all screens side by side, each at its real size, and encodes every
+// version as WebP. Returns { thumb, std, full } blobs.
+async function buildScreenshotVersions(screens) {
+  if (!Array.isArray(screens) || screens.length === 0) {
     throw new Error("No screenshot data received");
   }
 
-  const images = await Promise.all(dataUrls.map(loadImage));
+  const images = await Promise.all(screens.map((s) => loadImage(s.dataUrl)));
+  const sizes = images.map((img, i) => ({
+    width: screens[i].width || img.naturalWidth,
+    height: screens[i].height || img.naturalHeight,
+  }));
+  const fullWidth = sizes.reduce((sum, s) => sum + s.width, 0);
+  const fullHeight = Math.max(...sizes.map((s) => s.height));
 
-  const totalWidth = images.reduce((sum, img) => sum + img.naturalWidth, 0);
-  const maxHeight = Math.max(...images.map((img) => img.naturalHeight));
+  const versions = {};
+  for (const { name, height, quality } of SCREENSHOT_VERSIONS) {
+    const scale = height ? Math.min(1, height / fullHeight) : 1;
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.round(fullWidth * scale);
+    canvas.height = Math.round(fullHeight * scale);
+    const ctx = canvas.getContext("2d");
+    if (!ctx) {
+      throw new Error("Failed to prepare screenshot canvas");
+    }
 
-  const canvas = document.createElement("canvas");
-  canvas.width = totalWidth;
-  canvas.height = maxHeight;
-  const ctx = canvas.getContext("2d");
-  if (!ctx) {
-    throw new Error("Failed to prepare screenshot canvas");
+    let x = 0;
+    images.forEach((img, i) => {
+      const width = sizes[i].width * scale;
+      ctx.drawImage(img, x, 0, width, sizes[i].height * scale);
+      x += width;
+    });
+
+    versions[name] = await new Promise((resolve, reject) =>
+      canvas.toBlob(
+        (blob) =>
+          blob ? resolve(blob) : reject(new Error("Failed to encode screenshot")),
+        "image/webp",
+        quality,
+      ),
+    );
   }
-
-  let x = 0;
-  for (const img of images) {
-    ctx.drawImage(img, x, 0);
-    x += img.naturalWidth;
-  }
-
-  return canvas.toDataURL(
-    SCREENSHOT_UPLOAD_MIME_TYPE,
-    SCREENSHOT_UPLOAD_QUALITY,
-  );
+  return versions;
 }
 
 function normalizeCapturedScreens(captureResult) {
@@ -1527,6 +1548,8 @@ function normalizeCapturedScreens(captureResult) {
         screenName: item.screenName || `Screen ${index + 1}`,
         displayId: item.displayId ? String(item.displayId) : null,
         dataUrl,
+        width: item.width || null,
+        height: item.height || null,
       };
     })
     .filter(Boolean);
@@ -1546,14 +1569,9 @@ async function captureAndUpload() {
       );
     }
     const capturedScreens = normalizeCapturedScreens(captureResult);
-    const dataUrls = capturedScreens.map((screen) => screen.dataUrl);
-
-    if (dataUrls.length === 0) {
-      throw new Error("No screenshot data received");
-    }
-
-    const stitched = await stitchScreenshots(dataUrls);
-    const imageUrl = await uploadScreenshot(stitched);
+    const image = await uploadScreenshot(
+      await buildScreenshotVersions(capturedScreens),
+    );
     const now = new Date();
 
     const displayIds = capturedScreens
@@ -1590,7 +1608,7 @@ async function captureAndUpload() {
     await saveScreenshot(
       currentSessionId,
       currentUser.uid,
-      imageUrl,
+      image,
       now.toISOString(),
       {
         ...activeContext,

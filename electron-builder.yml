@@ -16,7 +16,7 @@ files:
   - renderer.js
   - styles.css
   - firebase.js
-  - cloudinary.js
+  - screenshotStorage.js
   - config.js
   - assets/**
   - package.json

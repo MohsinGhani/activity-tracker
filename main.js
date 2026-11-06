@@ -21,6 +21,12 @@ const Store = require("electron-store");
 const { autoUpdater } = require("electron-updater");
 const { execFile } = require("child_process");
 const util = require("util");
+const crypto = require("crypto");
+const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
+const { CognitoIdentityClient } = require("@aws-sdk/client-cognito-identity");
+const {
+  fromCognitoIdentityPool,
+} = require("@aws-sdk/credential-provider-cognito-identity");
 const execFilePromise = util.promisify(execFile);
 
 const store = new Store();
@@ -799,9 +805,26 @@ ipcMain.handle("open-input-monitoring-settings", async () => {
 
 ipcMain.handle("take-screenshot", async () => {
   try {
+    // Capture at each monitor's real pixel size. desktopCapturer scales every
+    // screen to fit one box (and upscales smaller screens to fill it), so ask
+    // for the largest real size and report each screen's real size; the
+    // renderer draws each screen back at that size.
+    const nativeSizes = new Map(
+      screen.getAllDisplays().map((d) => [
+        String(d.id),
+        {
+          width: Math.round(d.size.width * d.scaleFactor),
+          height: Math.round(d.size.height * d.scaleFactor),
+        },
+      ]),
+    );
+    const sizes = [...nativeSizes.values()];
     const sources = await desktopCapturer.getSources({
       types: ["screen"],
-      thumbnailSize: { width: 3840, height: 2160 },
+      thumbnailSize: {
+        width: Math.max(...sizes.map((s) => s.width)),
+        height: Math.max(...sizes.map((s) => s.height)),
+      },
     });
     if (!sources || sources.length === 0)
       throw new Error(
@@ -812,11 +835,14 @@ ipcMain.handle("take-screenshot", async () => {
       const fallbackName = `Screen ${index + 1}`;
       const screenName =
         s.name && s.name !== "Entire Screen" ? s.name : fallbackName;
+      const nativeSize = nativeSizes.get(String(s.display_id));
 
       return {
         screenName,
         displayId: s.display_id ? String(s.display_id) : null,
         dataUrl: s.thumbnail.toDataURL(),
+        width: nativeSize?.width ?? null,
+        height: nativeSize?.height ?? null,
       };
     });
   } catch (error) {
@@ -827,6 +853,43 @@ ipcMain.handle("take-screenshot", async () => {
     throw error;
   }
 });
+
+// Uploads one screenshot's versions (thumb/std/full) to S3. The Firebase ID
+// token is exchanged at the Cognito Identity Pool for short-lived AWS
+// credentials that can only write into this user's own folders, so no AWS
+// keys ship with the app. Returns the shared path: <identityId>/<date>/<id>.webp
+ipcMain.handle(
+  "upload-screenshot",
+  async (_e, { region, bucket, identityPoolId, projectId, idToken, files }) => {
+    try {
+      const credentials = await fromCognitoIdentityPool({
+        client: new CognitoIdentityClient({ region }),
+        identityPoolId,
+        logins: { [`securetoken.google.com/${projectId}`]: idToken },
+      })();
+      const day = new Date().toISOString().slice(0, 10);
+      const s3Path = `${credentials.identityId}/${day}/${crypto.randomUUID()}.webp`;
+      const s3 = new S3Client({ region, credentials });
+      await Promise.all(
+        files.map(({ version, bytes }) =>
+          s3.send(
+            new PutObjectCommand({
+              Bucket: bucket,
+              Key: `${version}/${s3Path}`,
+              Body: Buffer.from(bytes),
+              ContentType: "image/webp",
+              CacheControl: "private, max-age=31536000, immutable",
+            }),
+          ),
+        ),
+      );
+      return { s3Path };
+    } catch (error) {
+      await logError("upload-screenshot", error);
+      throw new Error(`Upload failed: ${error?.message || String(error)}`);
+    }
+  },
+);
 
 // Determine *why* activity detection failed by checking the actual OS
 // permission state, instead of fragile string-matching on the error message.

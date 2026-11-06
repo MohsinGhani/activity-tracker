@@ -8,6 +8,8 @@ contextBridge.exposeInMainWorld("tracker", {
   // window.tracker.platform instead of process.platform.
   platform: process.platform,
   takeScreenshot: () => ipcRenderer.invoke("take-screenshot"),
+  uploadScreenshot: (payload) =>
+    ipcRenderer.invoke("upload-screenshot", payload),
   getActivityContexts: (displayIds) =>
     ipcRenderer.invoke("get-activity-contexts", displayIds),
   getActivityContext: () => ipcRenderer.invoke("get-activity-context"),

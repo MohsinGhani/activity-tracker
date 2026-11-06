@@ -34,7 +34,7 @@ export async function endSession(id, duration, idleTime, endTime, startTime) {
 export async function updateUserStatus(id, status) { if (fb().sessions[id]) fb().sessions[id].status = status; }
 export async function getTodaySessionsSummary() { return { totalEndedSeconds: 0, totalIdleSeconds: 0, sessions: [] }; }
 `);
-fs.writeFileSync(path.join(dir, "cloudinary.js"), "export async function uploadScreenshot() { return ''; }");
+fs.writeFileSync(path.join(dir, "screenshotStorage.js"), "export async function uploadScreenshot() { return {}; }");
 
 console.log = () => {};
 console.error = () => {};
