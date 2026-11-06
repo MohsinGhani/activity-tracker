@@ -5,6 +5,7 @@
   "main": "main.js",
   "scripts": {
     "start": "electron .",
+    "test": "node --test test/session.test.mjs",
     "dist": "electron-builder --publish never",
     "dist:win": "electron-builder --win --publish always",
     "dist:mac": "electron-builder --mac --publish always",
