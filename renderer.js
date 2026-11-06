@@ -33,6 +33,9 @@ let isAppClosingHandled = false;
 let autoRestartInProgress = false;
 
 const IDLE_THRESHOLD_MS = 15 * 60 * 1000;
+// getIdleTime() has whole-second resolution and the Windows probe takes a
+// moment, so "last input" can look a few seconds later than it really was.
+const IDLE_INPUT_TOLERANCE_MS = 5 * 1000;
 const POWER_IDLE_EVENTS = new Set(["suspend", "lock-screen", "display-sleep"]);
 const POWER_ACTIVE_EVENTS = new Set(["resume", "unlock-screen", "display-on"]);
 
@@ -351,10 +354,7 @@ window.tracker.onPowerEvent(async (eventName) => {
   if (POWER_IDLE_EVENTS.has(eventName)) {
     if (!isIdle && !isSessionPaused) {
       const idleSeconds = Number(await window.tracker.getIdleTime());
-      const idleMs = Number.isFinite(idleSeconds)
-        ? idleSeconds * 1000
-        : IDLE_THRESHOLD_MS;
-      enterIdleMode(idleMs);
+      enterIdleMode(Number.isFinite(idleSeconds) ? idleSeconds * 1000 : 0);
       showToast("Session idle detected — time will be excluded from duration.");
     }
     return;
@@ -521,6 +521,7 @@ logoutBtn.addEventListener("click", async () => {
 });
 
 startBtn.addEventListener("click", async () => {
+  if (currentSessionId) return;
   startBtn.disabled = true;
   startBtn.textContent = "Starting\u2026";
   void window.tracker.logEvent?.("start", "Start clicked");
@@ -699,12 +700,6 @@ async function resumeSession() {
 async function endCurrentSession(endTimeMs = null) {
   if (!currentSessionId) return false;
 
-  // Duration = total elapsed time minus idle time (work time only)
-  const totalElapsedMs = getElapsedMs();
-  const trackedIdleMs = getTrackedIdleMs();
-  const workTimeMs = Math.max(0, totalElapsedMs - trackedIdleMs);
-  const duration = Math.floor(workTimeMs / 1000);
-  const idleTime = Math.floor(trackedIdleMs / 1000);
   const candidateEndTime =
     typeof endTimeMs === "number" || typeof endTimeMs === "string"
       ? new Date(endTimeMs)
@@ -714,6 +709,7 @@ async function endCurrentSession(endTimeMs = null) {
   const endTime = Number.isNaN(candidateEndTime.getTime())
     ? new Date()
     : candidateEndTime;
+  const { duration, idleTime } = getSessionTotalsAt(endTime.getTime());
 
   console.log(
     `[Session End Details] Duration: ${duration}s, Idle: ${idleTime}s, End Time: ${endTime.toISOString()} (${endTime.toLocaleTimeString()})`,
@@ -762,8 +758,7 @@ async function recoverPendingShutdownSession(pendingEndAtMs) {
   const effectiveEndAtMs = sessionStartedAtMs
     ? Math.min(getRolloverEndMs(sessionStartedAtMs), pendingEndAtMs)
     : pendingEndAtMs;
-  const duration = Math.floor(getElapsedMsAt(effectiveEndAtMs) / 1000);
-  const idleTime = Math.floor(totalIdleMs / 1000);
+  const { duration, idleTime } = getSessionTotalsAt(effectiveEndAtMs);
   const endTime = new Date(effectiveEndAtMs);
 
   try {
@@ -783,12 +778,20 @@ async function recoverPendingShutdownSession(pendingEndAtMs) {
   clearSessionState();
   await refreshTodayEndedSeconds();
   renderTodayTotalTime();
-  setInactiveUI();
+  // No setInactiveUI() here: during boot recovery it would re-enable Start
+  // before the auto-started session exists. Callers set the UI.
   showToast("Previous session was closed at the last shutdown time.");
   return true;
 }
 
 async function restoreSession() {
+  // Recovery below can close yesterday's session and auto-start a new one.
+  // A Start click in the meantime would create a second session that this
+  // code then forgets, leaving it "active" forever. Every exit path below
+  // sets the UI again (or resetStuckButtons does on error).
+  startBtn.disabled = true;
+  startBtn.textContent = "Restoring…";
+
   const sessionId = await window.tracker.storeGet("sessionId");
   const startTime = await window.tracker.storeGet("sessionStartTime");
   const startedAtMs = await window.tracker.storeGet("sessionStartedAtMs");
@@ -876,6 +879,7 @@ async function restoreSession() {
   }
 
   await window.tracker.storeSet("pendingSessionEndAtMs", null);
+  setInactiveUI();
 }
 
 async function startNewSessionAfterRecovery() {
@@ -921,10 +925,8 @@ async function startNewSessionAfterRecovery() {
 
 async function rolloverSessionAfterMidnight() {
   const rolloverEndTime = new Date(getRolloverEndMs(sessionStartedAtMs));
-  const rolloverDuration = Math.floor(
-    getElapsedMsAt(rolloverEndTime.getTime()) / 1000,
-  );
-  const rolloverIdleTime = Math.floor(totalIdleMs / 1000);
+  const { duration: rolloverDuration, idleTime: rolloverIdleTime } =
+    getSessionTotalsAt(rolloverEndTime.getTime());
 
   try {
     await endSession(
@@ -1087,14 +1089,19 @@ function getTrackedIdleMs(referenceMs = Date.now()) {
   return Math.max(0, totalIdleMs + getCurrentIdleMs(referenceMs));
 }
 
-function enterIdleMode(observedIdleMs = IDLE_THRESHOLD_MS) {
+function enterIdleMode(observedIdleMs = 0) {
   if (!currentSessionId || isSessionPaused || isIdle) return;
-  const normalizedIdleMs = Number.isFinite(Number(observedIdleMs))
-    ? Math.max(IDLE_THRESHOLD_MS, Number(observedIdleMs))
-    : IDLE_THRESHOLD_MS;
+  const observed = Number(observedIdleMs);
+  const now = Date.now();
 
   isIdle = true;
-  idleStartedAtMs = Date.now() - normalizedIdleMs;
+  // The OS reports time since the last input, which can reach back past this
+  // session's start (e.g. to last night after a morning boot). Never count
+  // idle from before the session (or the last resume) began.
+  idleStartedAtMs = Math.max(
+    now - (Number.isFinite(observed) ? Math.max(0, observed) : 0),
+    sessionStartTime ?? now,
+  );
   statusText.textContent = "Session active (idle detected)";
   statusText.className = "status-text active";
   renderTodayTotalTime();
@@ -1141,6 +1148,21 @@ function getElapsedMsAt(referenceMs) {
   if (!currentSessionId) return 0;
   if (!sessionStartTime) return elapsedBeforePauseMs;
   return elapsedBeforePauseMs + Math.max(0, referenceMs - sessionStartTime);
+}
+
+// The one place a session's saved totals are computed, for every end path
+// (End button, quit, next-boot recovery, midnight). Work = elapsed - idle, and
+// idle can never exceed elapsed.
+// ponytail: idle recorded after endMs (e.g. a recovery capped at 23:59:59 that
+// last saved next morning) can't be separated out, only capped. Keep per-day
+// idle in the store if exact splits ever matter.
+function getSessionTotalsAt(endMs) {
+  const elapsedMs = getElapsedMsAt(endMs);
+  const idleMs = Math.min(getTrackedIdleMs(endMs), elapsedMs);
+  return {
+    duration: Math.floor((elapsedMs - idleMs) / 1000),
+    idleTime: Math.floor(idleMs / 1000),
+  };
 }
 
 function getEffectiveSessionStartDate(referenceMs = Date.now()) {
@@ -1191,8 +1213,10 @@ function startIdlePoll() {
         enterIdleMode(idleMs);
         showToast("Session idle detected — time excluded from duration.");
       } else if (
-        idleMs < IDLE_THRESHOLD_MS &&
         isIdle &&
+        // Back only once there has been input since idle began. A plain
+        // "under 15 min" check would end a screen-lock idle 10s after it starts.
+        Date.now() - idleMs > idleStartedAtMs + IDLE_INPUT_TOLERANCE_MS &&
         !idleResumeInProgress
       ) {
         console.log("User is active, ending idle state");
@@ -1391,7 +1415,7 @@ function scheduleMidnightEnd() {
     const hasSessionToEnd = Boolean(currentSessionId);
 
     console.log(
-      `[Midnight Check] User Active: ${isUserActive}, Session Live: ${isSessionLive}, Session Paused: ${isSessionPaused}`,
+      `[Midnight Check] User Active: ${isUserActive}, Session Paused: ${isSessionPaused}`,
     );
 
     const endTime = new Date(rolloverTime);
