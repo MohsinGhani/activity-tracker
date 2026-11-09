@@ -529,10 +529,22 @@ function createWindow() {
 }
 
 function createTray() {
-  const trayIconName = process.platform === "win32" ? "icon.ico" : "icon.png";
+  // macOS draws tray images at their own size, so the 512px app icon filled
+  // the menu bar. Use a menu-bar-sized template image there instead: the
+  // "Template" suffix makes macOS tint it for light/dark menu bars, and the
+  // @2x file is picked up automatically on Retina screens.
+  const trayIconName =
+    process.platform === "win32"
+      ? "icon.ico"
+      : process.platform === "darwin"
+        ? "trayTemplate.png"
+        : "icon.png";
   let icon = nativeImage.createFromPath(
     path.join(__dirname, "assets", trayIconName),
   );
+  if (process.platform === "darwin") {
+    icon.setTemplateImage(true);
+  }
   if (icon.isEmpty()) {
     icon = nativeImage.createFromDataURL(
       "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVQI12NgAAIABQAABjE+ibYAAAAASUVORK5CYII=",
