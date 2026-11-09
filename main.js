@@ -149,6 +149,7 @@ async function checkForUpdatesSafe() {
   } catch (error) {
     const message = error?.message || String(error);
     console.error("Auto-update check failed:", message);
+    void logError("auto-update", error);
     sendUpdateStatus("error", message);
     return null;
   }
@@ -209,6 +210,7 @@ function configureAutoUpdates() {
   autoUpdater.on("error", (error) => {
     const message = error?.message || String(error);
     console.error("Auto-update error:", message);
+    void logError("auto-update", error);
     sendUpdateStatus("error", message);
   });
 

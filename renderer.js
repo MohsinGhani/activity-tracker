@@ -344,7 +344,12 @@ window.tracker.onUpdateStatus((payload) => {
 
   if (status === "error") {
     hideUpdateBanner();
-    showToast("Update check failed. Will retry automatically.");
+    const reason = typeof payload?.detail === "string" ? payload.detail : "";
+    showToast(
+      reason
+        ? `Update failed: ${reason.split("\n")[0].slice(0, 200)}`
+        : "Update failed. Will retry automatically.",
+    );
   }
 });
 

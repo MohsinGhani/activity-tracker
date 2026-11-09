@@ -43,9 +43,36 @@ jobs:
       - run: npm ci
       - run: npm install dmg-license
       - run: npx electron-builder install-app-deps
+
+      # macOS only installs an auto-update if it is signed by the same
+      # certificate as the running app. Ad-hoc builds get a new identity on
+      # every build, so updates were always rejected. We sign with a stable
+      # self-signed certificate; electron-builder only uses it once trusted.
+      - name: Trust the code-signing certificate
+        run: |
+          if [ -z "${{ secrets.MAC_CERT_P12_BASE64 }}" ]; then
+            echo "::error::MAC_CERT_P12_BASE64 secret is missing; the mac build would be ad-hoc signed and could not auto-update."
+            exit 1
+          fi
+          sudo security add-trusted-cert -d -r trustRoot -p codeSign \
+            -k /Library/Keychains/System.keychain .github/macos-signing-cert.pem
+
       - run: npm run dist:mac
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          CSC_LINK: ${{ secrets.MAC_CERT_P12_BASE64 }}
+          CSC_KEY_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
+          CSC_NAME: Inciter Tech Activity Tracker
+
+      - name: Verify the app is signed with the stable certificate
+        run: |
+          APP="$(ls -d release/mac*/*.app | head -1)"
+          REQ="$(codesign -d -r- "$APP" 2>&1 | tail -1)"
+          echo "$REQ"
+          echo "$REQ" | grep -q 'certificate root = H"b41ac1bc41106b5caca86e71b8cb8d9d5307833c"' || {
+            echo "::error::$APP is not signed with the Inciter Tech certificate; do not publish this release."
+            exit 1
+          }
 
   release_linux:
     runs-on: ubuntu-latest
