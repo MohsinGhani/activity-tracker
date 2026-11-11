@@ -33,6 +33,11 @@ export async function endSession(id, duration, idleTime, endTime, startTime) {
 }
 export async function updateUserStatus(id, status) { if (fb().sessions[id]) fb().sessions[id].status = status; }
 export async function getTodaySessionsSummary() { return { totalEndedSeconds: 0, totalIdleSeconds: 0, sessions: [] }; }
+export const TRACKER_SETTINGS_DEFAULTS = Object.freeze({ manualTimeAllowed: false, screenshotIntervalMin: 10, idleThresholdMin: 15 });
+export function watchTrackerSettings(userId, onChange) { onChange({ ...TRACKER_SETTINGS_DEFAULTS, ...(fb().settings || {}) }); return () => {}; }
+export async function getManualTimeForDay() { return []; }
+export async function addManualTime() { return "m1"; }
+export async function deleteManualTime() {}
 `);
 fs.writeFileSync(path.join(dir, "screenshotStorage.js"), "export async function uploadScreenshot() { return {}; }");
 
@@ -70,7 +75,7 @@ async function launch(atMs) {
       storeGet: async (k) => fb.store.get(k) ?? null,
       storeSet: async (k, v) => { if (v == null) fb.store.delete(k); else fb.store.set(k, v); },
       getIdleTime: async () => Math.floor((Date.now() - fb.lastInputMs) / 1000),
-      takeScreenshot: async () => { throw new Error("no screens in test"); },
+      takeScreenshot: async () => { fb.shots = (fb.shots || 0) + 1; throw new Error("no screens in test"); },
       showNotification: async () => {},
       logEvent: async () => {},
       onUpdateStatus() {}, onDiagnostic() {}, onAppClosing() {},
@@ -201,4 +206,46 @@ test("D: a session running at midnight is ended at 23:59:59 and a new one starts
   assert.equal(old.endTime.getTime(), at(15, 23, 59) + 59999);
   assert.ok(Math.abs(old.duration - 4 * 3600) < 120, `duration ${old.duration}s`);
   assert.equal(fresh?.status, "active", "no new session at 00:00");
+});
+
+test("E: the admin's idle threshold is used (5 min instead of 15)", async () => {
+  reset();
+  fb.settings = { idleThresholdMin: 5 };
+  fb.lastInputMs = at(17, 9);
+  const app = await launch(at(17, 9));
+  await app.click("start-btn");
+  await advance(1 * H, { working: true });
+  await advance(8 * MIN, { working: false }); // away 8 min: idle with a 5-min threshold
+  await advance(30 * MIN, { working: true });
+  await app.click("end-btn");
+
+  const [s1] = sessions();
+  assert.ok(s1.idleTime >= 5 * 60, `idle should be counted, got ${s1.idleTime}s`);
+});
+
+test("E: with the default 15-min threshold, 8 minutes away is not idle", async () => {
+  reset();
+  fb.lastInputMs = at(17, 9);
+  const app = await launch(at(17, 9));
+  await app.click("start-btn");
+  await advance(1 * H, { working: true });
+  await advance(8 * MIN, { working: false });
+  await advance(30 * MIN, { working: true });
+  await app.click("end-btn");
+
+  const [s1] = sessions();
+  assert.equal(s1.idleTime, 0);
+});
+
+test("F: the admin's screenshot interval is used (every 5 min instead of 10)", async () => {
+  reset();
+  fb.settings = { screenshotIntervalMin: 5 };
+  fb.lastInputMs = at(18, 9);
+  const app = await launch(at(18, 9));
+  await app.click("start-btn");
+  await advance(1 * H, { working: true });
+  await app.click("end-btn");
+
+  // One screenshot per 5-minute block: about 12 in an hour (10-min blocks give 6).
+  assert.ok(fb.shots >= 11 && fb.shots <= 13, `expected ~12 screenshot attempts, got ${fb.shots}`);
 });

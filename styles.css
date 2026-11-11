@@ -620,3 +620,214 @@ body {
   flex-shrink: 0;
   min-width: 88px;
 }
+
+/* ─── Manual time (INC-192, only when an admin allows it) ──────────────────── */
+#dashboard-view.active {
+  overflow-y: auto;
+}
+
+.today-manual-card {
+  flex: 1;
+  background: var(--bg-card);
+  border: 1px solid rgba(0, 165, 106, 0.5);
+  border-radius: var(--radius);
+  padding: 12px 10px;
+  text-align: center;
+}
+
+.today-manual-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  color: var(--accent);
+  margin-bottom: 4px;
+}
+
+.today-manual-value {
+  font-size: 18px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  font-family:
+    "SF Mono", "Fira Code", "Cascadia Code", "Courier New", monospace;
+  color: var(--accent-hover);
+}
+
+.btn-accent-sm {
+  padding: 8px 14px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 13px;
+}
+
+.btn-accent-sm:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+
+.manual-section {
+  order: 5;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.manual-section[hidden],
+.today-manual-card[hidden],
+.manual-overlay[hidden] {
+  display: none;
+}
+
+.manual-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.manual-title {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.manual-list {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.manual-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: var(--radius);
+  background: var(--bg-input);
+  font-size: 13px;
+}
+
+.manual-item-when {
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.manual-item-dur {
+  color: var(--accent-hover);
+  white-space: nowrap;
+}
+
+.manual-item-note {
+  flex: 1;
+  min-width: 0;
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.manual-item-delete {
+  width: 30px;
+  height: 30px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.manual-item-delete:hover {
+  color: var(--danger-hover);
+  background: rgba(228, 59, 0, 0.12);
+}
+
+.manual-empty {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.manual-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  background: rgba(5, 5, 15, 0.75);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.manual-dialog {
+  width: 440px;
+  max-width: calc(100% - 32px);
+  padding: 22px;
+  border-radius: 12px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  user-select: text;
+}
+
+.manual-dialog-title {
+  font-size: 17px;
+  font-weight: 700;
+}
+
+.manual-dialog-hint {
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin-top: -8px;
+}
+
+.manual-row {
+  display: flex;
+  gap: 12px;
+}
+
+.manual-field {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.manual-field input {
+  padding: 10px 12px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text-primary);
+  font-size: 14px;
+  color-scheme: dark;
+  outline: none;
+}
+
+.manual-field input:focus {
+  border-color: var(--accent);
+}
+
+.manual-preview {
+  font-size: 13px;
+  color: var(--accent-hover);
+  min-height: 18px;
+}
+
+.manual-preview.error {
+  color: var(--danger-hover);
+}
+
+.manual-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.manual-actions .btn {
+  min-height: 40px;
+  padding: 8px 16px;
+  font-size: 14px;
+}
