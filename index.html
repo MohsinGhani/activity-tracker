@@ -116,6 +116,70 @@
           <p class="today-idle-label">Today's Idle Time</p>
           <p id="today-idle-time" class="today-idle-value">00h 00m 00s</p>
         </div>
+        <div id="today-manual-card" class="today-manual-card" hidden>
+          <p class="today-manual-label">Today's Manual Time</p>
+          <p id="today-manual-time" class="today-manual-value">00h 00m</p>
+        </div>
+      </div>
+
+      <!-- Manual time: shown only when an admin allows it in the portal -->
+      <section id="manual-section" class="manual-section" hidden>
+        <div class="manual-header">
+          <p class="manual-title">Manual time today</p>
+          <button id="manual-add-btn" class="btn btn-accent-sm" type="button">
+            + Add manual time
+          </button>
+        </div>
+        <ul id="manual-list" class="manual-list"></ul>
+        <p id="manual-empty" class="manual-empty">
+          Add time you worked away from the tracker today.
+        </p>
+      </section>
+
+      <div id="manual-dialog" class="manual-overlay" hidden>
+        <form
+          id="manual-form"
+          class="manual-dialog"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="manual-dialog-title"
+        >
+          <p id="manual-dialog-title" class="manual-dialog-title">
+            Add manual time
+          </p>
+          <p class="manual-dialog-hint">
+            For work you did away from the tracker today.
+          </p>
+          <div class="manual-row">
+            <label class="manual-field"
+              >From
+              <input id="manual-from" type="time" required />
+            </label>
+            <label class="manual-field"
+              >To
+              <input id="manual-to" type="time" required />
+            </label>
+          </div>
+          <label class="manual-field"
+            >Note
+            <input
+              id="manual-note"
+              type="text"
+              maxlength="200"
+              placeholder="e.g. Client meeting, offline"
+              required
+            />
+          </label>
+          <p id="manual-preview" class="manual-preview" aria-live="polite"></p>
+          <div class="manual-actions">
+            <button id="manual-cancel" class="btn btn-ghost" type="button">
+              Cancel
+            </button>
+            <button id="manual-save" class="btn btn-accent-sm" type="submit">
+              Add time
+            </button>
+          </div>
+        </form>
       </div>
 
       <div id="diagnostics" class="diagnostics" role="alert" hidden>

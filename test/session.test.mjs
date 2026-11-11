@@ -27,14 +27,21 @@ export async function createSession(userId) {
   await gate("createSession");
   return id;
 }
-export async function endSession(id, duration, idleTime, endTime, startTime) {
+export async function endSession(id, duration, idleTime, endTime, startTime, segments) {
   await gate("endSession");
-  Object.assign(fb().sessions[id], { duration, idleTime, endTime, startTime, status: "ended" });
+  Object.assign(fb().sessions[id], { duration, idleTime, endTime, startTime, status: "ended", ...(segments ? { segments } : {}) });
 }
 export async function updateUserStatus(id, status) { if (fb().sessions[id]) fb().sessions[id].status = status; }
 export async function getTodaySessionsSummary() { return { totalEndedSeconds: 0, totalIdleSeconds: 0, sessions: [] }; }
+export const TRACKER_SETTINGS_DEFAULTS = Object.freeze({ manualTimeAllowed: false, screenshotIntervalMin: 10, idleThresholdMin: 15 });
+export function watchTrackerSettings(userId, onChange) { onChange({ ...TRACKER_SETTINGS_DEFAULTS, ...(fb().settings || {}) }); return () => {}; }
+export async function getManualTimeForDay() { return []; }
+export async function addManualTime() { return "m1"; }
+export async function deleteManualTime() {}
+export async function saveSessionSegments(id, segments) { if (fb().sessions[id]) fb().sessions[id].segments = segments; }
 `);
 fs.writeFileSync(path.join(dir, "screenshotStorage.js"), "export async function uploadScreenshot() { return {}; }");
+fs.copyFileSync(new URL("../manualOverride.js", import.meta.url), path.join(dir, "manualOverride.js"));
 
 console.log = () => {};
 console.error = () => {};
@@ -70,7 +77,7 @@ async function launch(atMs) {
       storeGet: async (k) => fb.store.get(k) ?? null,
       storeSet: async (k, v) => { if (v == null) fb.store.delete(k); else fb.store.set(k, v); },
       getIdleTime: async () => Math.floor((Date.now() - fb.lastInputMs) / 1000),
-      takeScreenshot: async () => { throw new Error("no screens in test"); },
+      takeScreenshot: async () => { fb.shots = (fb.shots || 0) + 1; throw new Error("no screens in test"); },
       showNotification: async () => {},
       logEvent: async () => {},
       onUpdateStatus() {}, onDiagnostic() {}, onAppClosing() {},
@@ -201,4 +208,112 @@ test("D: a session running at midnight is ended at 23:59:59 and a new one starts
   assert.equal(old.endTime.getTime(), at(15, 23, 59) + 59999);
   assert.ok(Math.abs(old.duration - 4 * 3600) < 120, `duration ${old.duration}s`);
   assert.equal(fresh?.status, "active", "no new session at 00:00");
+});
+
+test("E: the admin's idle threshold is used (5 min instead of 15)", async () => {
+  reset();
+  fb.settings = { idleThresholdMin: 5 };
+  fb.lastInputMs = at(17, 9);
+  const app = await launch(at(17, 9));
+  await app.click("start-btn");
+  await advance(1 * H, { working: true });
+  await advance(8 * MIN, { working: false }); // away 8 min: idle with a 5-min threshold
+  await advance(30 * MIN, { working: true });
+  await app.click("end-btn");
+
+  const [s1] = sessions();
+  assert.ok(s1.idleTime >= 5 * 60, `idle should be counted, got ${s1.idleTime}s`);
+});
+
+test("E: with the default 15-min threshold, 8 minutes away is not idle", async () => {
+  reset();
+  fb.lastInputMs = at(17, 9);
+  const app = await launch(at(17, 9));
+  await app.click("start-btn");
+  await advance(1 * H, { working: true });
+  await advance(8 * MIN, { working: false });
+  await advance(30 * MIN, { working: true });
+  await app.click("end-btn");
+
+  const [s1] = sessions();
+  assert.equal(s1.idleTime, 0);
+});
+
+test("F: the admin's screenshot interval is used (every 5 min instead of 10)", async () => {
+  reset();
+  fb.settings = { screenshotIntervalMin: 5 };
+  fb.lastInputMs = at(18, 9);
+  const app = await launch(at(18, 9));
+  await app.click("start-btn");
+  await advance(1 * H, { working: true });
+  await app.click("end-btn");
+
+  // One screenshot per 5-minute block: about 12 in an hour (10-min blocks give 6).
+  assert.ok(fb.shots >= 11 && fb.shots <= 13, `expected ~12 screenshot attempts, got ${fb.shots}`);
+});
+
+test("G: a session saves its active/idle blocks (idle starts at the last input)", async () => {
+  reset();
+  fb.lastInputMs = at(19, 9);
+  const app = await launch(at(19, 9));
+  await app.click("start-btn");
+  await advance(1 * H, { working: true });       // 09:00-10:00 active
+  await advance(30 * MIN, { working: false });   // 10:00-10:30 away (idle after 15 min, backdated)
+  await advance(30 * MIN, { working: true });    // 10:30-11:00 active
+  await app.click("end-btn");
+
+  const [s1] = sessions();
+  const blocks = (s1.segments || []).map((b) => b.k + Math.round((b.e - b.s) / MIN));
+  assert.equal(s1.segments?.[0]?.k, "a");
+  const idle = s1.segments.filter((b) => b.k === "i").reduce((n, b) => n + (b.e - b.s), 0);
+  const active = s1.segments.filter((b) => b.k === "a").reduce((n, b) => n + (b.e - b.s), 0);
+  assert.ok(Math.abs(idle - 30 * MIN) <= 1 * MIN, `idle blocks ${blocks.join(",")}`);
+  assert.ok(Math.abs(active - 90 * MIN) <= 1 * MIN, `active blocks ${blocks.join(",")}`);
+});
+
+test("H: manual time replaces the tracked minutes it covers, whatever they were", async () => {
+  const { applyManualOverride } = await import(new URL("../manualOverride.js", import.meta.url).href);
+  // Tracker 13:00-17:00; idle 14:00-14:20 and 14:30-15:00 (mouse moved 14:20-14:30), idle 15:45-16:00.
+  const t = (h, m = 0) => Date.UTC(2026, 10, 11, h, m);
+  const segments = [
+    { k: "a", s: t(13), e: t(14) }, { k: "i", s: t(14), e: t(14, 20) }, { k: "a", s: t(14, 20), e: t(14, 30) },
+    { k: "i", s: t(14, 30), e: t(15) }, { k: "a", s: t(15), e: t(15, 45) }, { k: "i", s: t(15, 45), e: t(16) },
+    { k: "a", s: t(16), e: t(17) },
+  ];
+  const r = applyManualOverride([{ start: t(13), end: t(17), segments }], [{ start: t(14), end: t(15) }]);
+  assert.equal(r.idleCut, 50 * MIN);
+  assert.equal(r.activeCut, 10 * MIN);
+  assert.deepEqual(r.replaced, [{ activeMs: 10 * MIN, idleMs: 50 * MIN }]);
+
+  // Partly outside tracked time: only the overlapping half replaces anything.
+  const r2 = applyManualOverride([{ start: t(13), end: t(17), segments }], [{ start: t(12, 30), end: t(13, 30) }]);
+  assert.equal(r2.activeCut, 30 * MIN);
+  assert.equal(r2.idleCut, 0);
+
+  // Older session without blocks: split by its idle share (1h idle of 4h).
+  const r3 = applyManualOverride([{ start: t(13), end: t(17), activeMs: 180 * MIN, idleMs: 60 * MIN }], [{ start: t(14), end: t(15) }]);
+  assert.equal(Math.round(r3.idleCut / MIN), 15);
+  assert.equal(Math.round(r3.activeCut / MIN), 45);
+});
+
+test("I: deleting manual time gives the tracked minutes back; overlapping entries count once", async () => {
+  const { applyManualOverride, mergeWindows } = await import(new URL("../manualOverride.js", import.meta.url).href);
+  const t = (h, m = 0) => Date.UTC(2026, 10, 11, h, m);
+  const session = { start: t(13), end: t(17), segments: [
+    { k: "a", s: t(13), e: t(14) }, { k: "i", s: t(14), e: t(15) }, { k: "a", s: t(15), e: t(17) },
+  ] };
+  // Added: 14:00-15:00 replaces the idle hour.
+  const added = applyManualOverride([session], mergeWindows([{ start: t(14), end: t(15) }]));
+  assert.equal(added.idleCut, 60 * MIN);
+  assert.equal(added.activeCut, 0);
+  // Deleted: nothing is replaced any more, so idle is back.
+  const deleted = applyManualOverride([session], mergeWindows([]));
+  assert.equal(deleted.idleCut, 0);
+  assert.equal(deleted.activeCut, 0);
+  // Two overlapping entries (e.g. two devices) are merged before anything is replaced.
+  const merged = mergeWindows([{ start: t(14), end: t(15) }, { start: t(14, 30), end: t(15, 30) }]);
+  assert.deepEqual(merged, [{ start: t(14), end: t(15, 30) }]);
+  const both = applyManualOverride([session], merged);
+  assert.equal(both.idleCut, 60 * MIN);
+  assert.equal(both.activeCut, 30 * MIN);
 });

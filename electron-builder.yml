@@ -17,6 +17,7 @@ files:
   - styles.css
   - firebase.js
   - screenshotStorage.js
+  - manualOverride.js
   - config.js
   - assets/**
   - package.json

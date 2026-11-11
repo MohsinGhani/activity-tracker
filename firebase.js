@@ -18,6 +18,9 @@ import {
   getDocs,
   query,
   where,
+  onSnapshot,
+  deleteDoc,
+  Timestamp,
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 import { firebaseConfig } from "./config.js";
 
@@ -101,6 +104,7 @@ export async function endSession(
   idleTime,
   endTime,
   startTime,
+  segments,
 ) {
   return updateDoc(doc(db, "sessions", sessionId), {
     startTime,
@@ -108,7 +112,16 @@ export async function endSession(
     duration,
     idleTime,
     status: "ended",
+    ...(Array.isArray(segments) ? { segments } : {}),
   });
+}
+
+// The session's active/idle blocks so far ([{ k: "a" | "i", s, e }], ms),
+// so manual time can replace the exact minutes it covers (INC-192).
+export function saveSessionSegments(sessionId, segments) {
+  return updateDoc(doc(db, "sessions", sessionId), { segments }).catch((err) =>
+    console.error("Failed to save session blocks:", err),
+  );
 }
 
 function toDateOrNull(value) {
@@ -183,6 +196,7 @@ export async function getTodaySessionsSummary(userId, dayStart, dayEnd) {
       duration: normalizedDuration,
       endedSecondsForToday,
       idleSecondsForToday,
+      segments: Array.isArray(data?.segments) ? data.segments : null,
       startTime: startDate,
       endTime: endDate,
     });
@@ -200,4 +214,85 @@ export async function getTodaySessionsSummary(userId, dayStart, dayEnd) {
     totalEndedSeconds: Math.max(0, totalEndedSeconds),
     totalIdleSeconds: Math.max(0, totalIdleSeconds),
   };
+}
+
+// ─── Tracker settings (set by admins in the portal) ─────────────────────────
+
+export const TRACKER_SETTINGS_DEFAULTS = Object.freeze({
+  manualTimeAllowed: false,
+  screenshotIntervalMin: 10,
+  idleThresholdMin: 15,
+});
+const SCREENSHOT_INTERVAL_OPTIONS = [5, 10, 15, 20, 25, 30];
+const IDLE_THRESHOLD_OPTIONS = [5, 10, 15, 20, 30];
+
+export function normalizeTrackerSettings(raw) {
+  const shot = Number(raw?.screenshotIntervalMin);
+  const idle = Number(raw?.idleThresholdMin);
+  return {
+    manualTimeAllowed: raw?.manualTimeAllowed === true,
+    screenshotIntervalMin: SCREENSHOT_INTERVAL_OPTIONS.includes(shot)
+      ? shot
+      : TRACKER_SETTINGS_DEFAULTS.screenshotIntervalMin,
+    idleThresholdMin: IDLE_THRESHOLD_OPTIONS.includes(idle)
+      ? idle
+      : TRACKER_SETTINGS_DEFAULTS.idleThresholdMin,
+  };
+}
+
+// Calls onChange with this user's settings now and whenever an admin changes
+// them (1 read at start, 1 per change). Falls back to the defaults on error.
+// Returns a function that stops listening.
+export function watchTrackerSettings(userId, onChange) {
+  return onSnapshot(
+    doc(db, "trackerSettings", userId),
+    (snap) => onChange(normalizeTrackerSettings(snap.exists() ? snap.data() : null)),
+    (error) => {
+      console.error("Failed to load tracker settings:", error);
+      onChange({ ...TRACKER_SETTINGS_DEFAULTS });
+    },
+  );
+}
+
+// ─── Manual time (only when an admin has allowed it) ────────────────────────
+// One document per entry. `date` is the Pakistan-time day (YYYY-MM-DD) the
+// portal groups activity by.
+
+export async function getManualTimeForDay(userId, date) {
+  const q = query(
+    collection(db, "manualTime"),
+    where("userId", "==", userId),
+    where("date", "==", date),
+  );
+  const snapshot = await getDocs(q);
+  return snapshot.docs
+    .map((item) => {
+      const data = item.data();
+      return {
+        id: item.id,
+        start: toDateOrNull(data.start),
+        end: toDateOrNull(data.end),
+        minutes: Number(data.minutes) || 0,
+        note: typeof data.note === "string" ? data.note : "",
+      };
+    })
+    .filter((entry) => entry.start && entry.end)
+    .sort((a, b) => a.start - b.start);
+}
+
+export async function addManualTime(userId, { date, start, end, note }) {
+  const docRef = await addDoc(collection(db, "manualTime"), {
+    userId,
+    date,
+    start: Timestamp.fromDate(start),
+    end: Timestamp.fromDate(end),
+    minutes: Math.round((end.getTime() - start.getTime()) / 60000),
+    note,
+    createdAt: serverTimestamp(),
+  });
+  return docRef.id;
+}
+
+export function deleteManualTime(entryId) {
+  return deleteDoc(doc(db, "manualTime", entryId));
 }
