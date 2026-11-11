@@ -295,3 +295,25 @@ test("H: manual time replaces the tracked minutes it covers, whatever they were"
   assert.equal(Math.round(r3.idleCut / MIN), 15);
   assert.equal(Math.round(r3.activeCut / MIN), 45);
 });
+
+test("I: deleting manual time gives the tracked minutes back; overlapping entries count once", async () => {
+  const { applyManualOverride, mergeWindows } = await import(new URL("../manualOverride.js", import.meta.url).href);
+  const t = (h, m = 0) => Date.UTC(2026, 10, 11, h, m);
+  const session = { start: t(13), end: t(17), segments: [
+    { k: "a", s: t(13), e: t(14) }, { k: "i", s: t(14), e: t(15) }, { k: "a", s: t(15), e: t(17) },
+  ] };
+  // Added: 14:00-15:00 replaces the idle hour.
+  const added = applyManualOverride([session], mergeWindows([{ start: t(14), end: t(15) }]));
+  assert.equal(added.idleCut, 60 * MIN);
+  assert.equal(added.activeCut, 0);
+  // Deleted: nothing is replaced any more, so idle is back.
+  const deleted = applyManualOverride([session], mergeWindows([]));
+  assert.equal(deleted.idleCut, 0);
+  assert.equal(deleted.activeCut, 0);
+  // Two overlapping entries (e.g. two devices) are merged before anything is replaced.
+  const merged = mergeWindows([{ start: t(14), end: t(15) }, { start: t(14, 30), end: t(15, 30) }]);
+  assert.deepEqual(merged, [{ start: t(14), end: t(15, 30) }]);
+  const both = applyManualOverride([session], merged);
+  assert.equal(both.idleCut, 60 * MIN);
+  assert.equal(both.activeCut, 30 * MIN);
+});

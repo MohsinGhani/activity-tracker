@@ -49,3 +49,16 @@ export function applyManualOverride(sessions, entries) {
 
   return { activeCut, idleCut, replaced };
 }
+
+// Overlapping or touching windows merged into one, so time counts once
+// (e.g. entries added from two devices).
+export function mergeWindows(windows) {
+  const sorted = windows.filter((w) => w.end > w.start).sort((a, b) => a.start - b.start);
+  const out = [];
+  for (const w of sorted) {
+    const last = out[out.length - 1];
+    if (last && w.start <= last.end) last.end = Math.max(last.end, w.end);
+    else out.push({ start: w.start, end: w.end });
+  }
+  return out;
+}

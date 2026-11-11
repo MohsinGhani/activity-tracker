@@ -15,7 +15,7 @@ import {
   saveSessionSegments,
 } from "./firebase.js";
 import { uploadScreenshot } from "./screenshotStorage.js";
-import { applyManualOverride } from "./manualOverride.js";
+import { applyManualOverride, mergeWindows } from "./manualOverride.js";
 
 let currentUser = null;
 let currentSessionId = null;
@@ -1131,6 +1131,7 @@ async function refreshTodayEndedSeconds() {
       activeMs: (session.endedSecondsForToday || 0) * 1000,
       idleMs: (session.idleSecondsForToday || 0) * 1000,
       segments: session.segments,
+      ended: session.status === "ended",
     }));
 
     console.log("Today's sessions summary", {
@@ -1145,18 +1146,24 @@ async function refreshTodayEndedSeconds() {
   }
 }
 
+// Today's manual entries as merged windows (overlaps count once), in ms.
+function manualWindows() {
+  return mergeWindows(
+    manualEntries.map((e) => ({ start: e.start.getTime(), end: e.end.getTime() })),
+  );
+}
+
 // Tracked active/idle time that today's manual entries replace (INC-192).
 function getManualOverrideCuts() {
   if (!manualEntries.length) return { activeCut: 0, idleCut: 0 };
   const now = Date.now();
-  const sessions = todaySessions.filter((x) => x.id !== currentSessionId);
+  // Only ended sessions are in Today's figures (plus the current one, below),
+  // so only they can have minutes replaced.
+  const sessions = todaySessions.filter((x) => x.ended && x.id !== currentSessionId);
   if (currentSessionId) {
     sessions.push({ start: sessionStartedAtMs || now, end: now, segments: currentSegments(now) });
   }
-  return applyManualOverride(
-    sessions,
-    manualEntries.map((e) => ({ start: e.start.getTime(), end: e.end.getTime() })),
-  );
+  return applyManualOverride(sessions, manualWindows());
 }
 
 function renderTodayTotalTime() {
@@ -2019,7 +2026,9 @@ function renderManualTime() {
     return;
   }
 
-  const total = manualEntries.reduce((sum, e) => sum + e.minutes, 0);
+  const total = Math.round(
+    manualWindows().reduce((sum, w) => sum + (w.end - w.start), 0) / 60000,
+  );
   if (manualTimeValue) manualTimeValue.textContent = formatMinutes(total);
 
   manualList.replaceChildren(
