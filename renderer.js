@@ -12,8 +12,10 @@ import {
   getManualTimeForDay,
   addManualTime,
   deleteManualTime,
+  saveSessionSegments,
 } from "./firebase.js";
 import { uploadScreenshot } from "./screenshotStorage.js";
+import { applyManualOverride } from "./manualOverride.js";
 
 let currentUser = null;
 let currentSessionId = null;
@@ -33,8 +35,50 @@ let pausedDueToIdle = false;
 let idleResumeInProgress = false;
 let todayEndedSeconds = 0;
 let todayIdleSeconds = 0;
-// [{ start, end }] in ms for today's tracker sessions; end null = still open.
-let todaySessionRanges = [];
+// Today's tracker sessions as { id, start, end, activeMs, idleMs, segments }.
+let todaySessions = [];
+// Today's manual time entries: [{ id, start: Date, end: Date, minutes, note }].
+let manualEntries = [];
+
+// Active/idle blocks of the current session, so manual time can replace the
+// exact minutes it covers: [{ k: "a" | "i", s, e }] in ms. Paused time has no
+// block. Saved with the session (sessions/{id}.segments).
+let segmentLog = [];
+let openSegment = null;
+
+function closeSegment(endMs) {
+  if (!openSegment) return;
+  const e = Math.max(openSegment.s, Math.round(endMs));
+  if (e > openSegment.s) segmentLog.push({ k: openSegment.k, s: openSegment.s, e });
+  openSegment = null;
+}
+
+function openSegmentAt(kind, startMs) {
+  let s = Math.round(startMs);
+  if (openSegment) {
+    // A backdated start (e.g. idle since the last input) never reaches before
+    // the block it ends.
+    s = Math.max(s, openSegment.s);
+    closeSegment(s);
+  }
+  openSegment = { k: kind, s };
+}
+
+function beginSegments(startMs) {
+  segmentLog = [];
+  openSegment = null;
+  openSegmentAt("a", startMs);
+}
+
+function currentSegments(nowMs = Date.now()) {
+  return openSegment
+    ? [...segmentLog, { k: openSegment.k, s: openSegment.s, e: Math.max(openSegment.s, nowMs) }]
+    : [...segmentLog];
+}
+
+function syncSegments() {
+  if (currentSessionId) void saveSessionSegments(currentSessionId, currentSegments());
+}
 let idleStartedAtMs = null;
 let isAppClosingHandled = false;
 let autoRestartInProgress = false;
@@ -601,6 +645,7 @@ startBtn.addEventListener("click", async () => {
     currentSessionId = sessionId;
     sessionStartTime = Date.now();
     sessionStartedAtMs = sessionStartTime;
+    beginSegments(sessionStartTime);
     elapsedBeforePauseMs = 0;
     totalIdleMs = 0;
     isSessionPaused = false;
@@ -659,9 +704,12 @@ async function pauseSession(dueToIdle = false, idleMs = null) {
     // Record when idle was first detected so we can track the full duration
     idleStartedAtMs = Date.now();
     elapsedBeforePauseMs = elapsedAtPauseMs;
+    openSegmentAt("i", Date.now() - requestedIdleMs);
   } else {
     elapsedBeforePauseMs = elapsedAtPauseMs;
+    closeSegment(Date.now());
   }
+  syncSegments();
   // Update user status in DB
   if (currentSessionId && dueToIdle) {
     void updateUserStatus(currentSessionId, "idle");
@@ -703,6 +751,7 @@ async function resumeSession() {
   isSessionPaused = false;
   pausedDueToIdle = false;
   isIdle = false;
+  openSegmentAt("a", sessionStartTime);
   await persistSessionState();
   startTimer();
   scheduleNextScreenshot();
@@ -735,6 +784,7 @@ async function endCurrentSession(endTimeMs = null) {
   );
 
   clearTimers();
+  closeSegment(endTime.getTime());
 
   let firebaseSaved = false;
   try {
@@ -744,6 +794,7 @@ async function endCurrentSession(endTimeMs = null) {
       idleTime,
       endTime,
       getEffectiveSessionStartDate(endTime.getTime()),
+      segmentLog.filter((seg) => seg.s < endTime.getTime()),
     );
     firebaseSaved = true;
     console.log(
@@ -779,6 +830,10 @@ async function recoverPendingShutdownSession(pendingEndAtMs) {
     : pendingEndAtMs;
   const { duration, idleTime } = getSessionTotalsAt(effectiveEndAtMs);
   const endTime = new Date(effectiveEndAtMs);
+  closeSegment(effectiveEndAtMs);
+  const savedSegments = segmentLog
+    .filter((seg) => seg.s < effectiveEndAtMs)
+    .map((seg) => ({ ...seg, e: Math.min(seg.e, effectiveEndAtMs) }));
 
   try {
     await endSession(
@@ -787,6 +842,7 @@ async function recoverPendingShutdownSession(pendingEndAtMs) {
       idleTime,
       endTime,
       getEffectiveSessionStartDateAt(effectiveEndAtMs),
+      savedSegments,
     );
   } catch (err) {
     console.error("Failed to recover session after shutdown:", err);
@@ -837,6 +893,9 @@ async function restoreSession() {
     sessionStartedAtMs = Number.isFinite(Number(startedAtMs))
       ? Number(startedAtMs)
       : restoredStartTime;
+    const storedSegments = await window.tracker.storeGet("sessionSegments");
+    segmentLog = Array.isArray(storedSegments?.log) ? storedSegments.log : [];
+    openSegment = storedSegments?.open ?? null;
 
     if (pendingSessionEndAtMs) {
       const endpointMs = Number.isFinite(lastPersistedAtMs)
@@ -915,6 +974,7 @@ async function startNewSessionAfterRecovery() {
     currentSessionId = sessionId;
     sessionStartTime = Date.now();
     sessionStartedAtMs = sessionStartTime;
+    beginSegments(sessionStartTime);
     elapsedBeforePauseMs = 0;
     totalIdleMs = 0;
     isSessionPaused = false;
@@ -966,6 +1026,7 @@ async function rolloverSessionAfterMidnight() {
   currentSessionId = freshSessionId;
   sessionStartTime = Date.now();
   sessionStartedAtMs = sessionStartTime;
+  beginSegments(sessionStartTime);
   elapsedBeforePauseMs = 0;
   totalIdleMs = 0;
   isSessionPaused = false;
@@ -1063,9 +1124,13 @@ async function refreshTodayEndedSeconds() {
     );
     todayEndedSeconds = summary.totalEndedSeconds;
     todayIdleSeconds = summary.totalIdleSeconds;
-    todaySessionRanges = summary.sessions.map((session) => ({
+    todaySessions = summary.sessions.map((session) => ({
+      id: session.id,
       start: session.startTime?.getTime() || 0,
-      end: session.endTime?.getTime() || null,
+      end: session.endTime?.getTime() || Date.now(),
+      activeMs: (session.endedSecondsForToday || 0) * 1000,
+      idleMs: (session.idleSecondsForToday || 0) * 1000,
+      segments: session.segments,
     }));
 
     console.log("Today's sessions summary", {
@@ -1080,13 +1145,31 @@ async function refreshTodayEndedSeconds() {
   }
 }
 
+// Tracked active/idle time that today's manual entries replace (INC-192).
+function getManualOverrideCuts() {
+  if (!manualEntries.length) return { activeCut: 0, idleCut: 0 };
+  const now = Date.now();
+  const sessions = todaySessions.filter((x) => x.id !== currentSessionId);
+  if (currentSessionId) {
+    sessions.push({ start: sessionStartedAtMs || now, end: now, segments: currentSegments(now) });
+  }
+  return applyManualOverride(
+    sessions,
+    manualEntries.map((e) => ({ start: e.start.getTime(), end: e.end.getTime() })),
+  );
+}
+
 function renderTodayTotalTime() {
   if (!todayTotalTime) return;
   // Show work time only (excluding idle time)
   const trackedIdleMs = getTrackedIdleMs();
+  const { activeCut, idleCut } = getManualOverrideCuts();
   const currentSessionWorkMs = Math.max(0, getElapsedMs() - trackedIdleMs);
   const currentSessionSeconds = Math.floor(currentSessionWorkMs / 1000);
-  const totalSeconds = Math.max(0, todayEndedSeconds + currentSessionSeconds);
+  const totalSeconds = Math.max(
+    0,
+    todayEndedSeconds + currentSessionSeconds - Math.floor(activeCut / 1000),
+  );
   const h = Math.floor(totalSeconds / 3600);
   const m = Math.floor((totalSeconds % 3600) / 60);
   const s = totalSeconds % 60;
@@ -1095,7 +1178,10 @@ function renderTodayTotalTime() {
   // Show idle time: completed idle (from Firebase) + current session idle
   if (todayIdleTime) {
     const currentIdleSeconds = Math.floor(trackedIdleMs / 1000);
-    const totalIdleSecs = Math.max(0, todayIdleSeconds + currentIdleSeconds);
+    const totalIdleSecs = Math.max(
+      0,
+      todayIdleSeconds + currentIdleSeconds - Math.floor(idleCut / 1000),
+    );
     const ih = Math.floor(totalIdleSecs / 3600);
     const im = Math.floor((totalIdleSecs % 3600) / 60);
     const is = totalIdleSecs % 60;
@@ -1125,6 +1211,7 @@ function enterIdleMode(observedIdleMs = 0) {
     now - (Number.isFinite(observed) ? Math.max(0, observed) : 0),
     sessionStartTime ?? now,
   );
+  openSegmentAt("i", idleStartedAtMs);
   statusText.textContent = "Session active (idle detected)";
   statusText.className = "status-text active";
   renderTodayTotalTime();
@@ -1141,6 +1228,9 @@ function exitIdleMode() {
   totalIdleMs = getTrackedIdleMs();
   isIdle = false;
   idleStartedAtMs = null;
+  if (isSessionPaused) closeSegment(Date.now());
+  else openSegmentAt("a", Date.now());
+  syncSegments();
 
   if (!isSessionPaused) {
     statusText.textContent = "Session active";
@@ -1380,6 +1470,7 @@ function scheduleNewSessionAtRollover(targetTimeMs = null) {
       currentSessionId = sessionId;
       sessionStartTime = Date.now();
       sessionStartedAtMs = sessionStartTime;
+      beginSegments(sessionStartTime);
       elapsedBeforePauseMs = 0;
       totalIdleMs = 0;
       isSessionPaused = false;
@@ -1786,6 +1877,8 @@ function clearSessionState() {
   pausedDueToIdle = false;
   idleResumeInProgress = false;
   idleStartedAtMs = null;
+  segmentLog = [];
+  openSegment = null;
 }
 
 async function clearStoredSession() {
@@ -1797,6 +1890,7 @@ async function clearStoredSession() {
   await window.tracker.storeSet("sessionIdleMs", null);
   await window.tracker.storeSet("sessionPaused", null);
   await window.tracker.storeSet("sessionPersistedAtMs", null);
+  await window.tracker.storeSet("sessionSegments", null);
   await window.tracker.storeSet("pendingSessionEndAtMs", null);
 }
 
@@ -1806,6 +1900,7 @@ async function persistSessionState() {
   await window.tracker.storeSet("sessionElapsedMs", elapsedBeforePauseMs);
   await window.tracker.storeSet("sessionIdleMs", getTrackedIdleMs());
   await window.tracker.storeSet("sessionPaused", isSessionPaused);
+  await window.tracker.storeSet("sessionSegments", { log: segmentLog, open: openSegment });
   await window.tracker.storeSet("sessionPersistedAtMs", Date.now());
 }
 
@@ -1841,7 +1936,6 @@ const manualPreview = document.getElementById("manual-preview");
 const manualCancel = document.getElementById("manual-cancel");
 const manualSave = document.getElementById("manual-save");
 
-let manualEntries = [];
 let manualDate = null;
 
 // The portal groups activity by Pakistan-time day.
@@ -1894,6 +1988,7 @@ async function loadManualEntries() {
   manualDate = getPkDateString();
   try {
     manualEntries = await getManualTimeForDay(currentUser.uid, manualDate);
+    renderTodayTotalTime();
   } catch (err) {
     console.error("Failed to load manual time:", err);
     manualEntries = [];
@@ -1979,14 +2074,7 @@ function validateManualEntry(start, end) {
   const e = end.getTime();
   const overlaps = (a, b) => s < b && e > a;
 
-  const now = Date.now();
-  const tracked = [...todaySessionRanges];
-  if (currentSessionId && sessionStartTime) {
-    tracked.push({ start: Number(sessionStartTime), end: now });
-  }
-  if (tracked.some((r) => r.start && overlaps(r.start, r.end ?? now))) {
-    return "This overlaps time the tracker already recorded.";
-  }
+  // Overlapping tracked time is fine: manual time replaces it.
   if (manualEntries.some((x) => overlaps(x.start.getTime(), x.end.getTime()))) {
     return "This overlaps manual time you already added.";
   }
@@ -2042,6 +2130,7 @@ async function submitManualEntry(event) {
     ].sort((a, b) => a.start - b.start);
     closeManualDialog();
     renderManualTime();
+    renderTodayTotalTime();
     showToast("Manual time added.");
   } catch (err) {
     console.error("Failed to add manual time:", err);
@@ -2059,6 +2148,7 @@ async function removeManualEntry(entry) {
     await deleteManualTime(entry.id);
     manualEntries = manualEntries.filter((x) => x.id !== entry.id);
     renderManualTime();
+    renderTodayTotalTime();
     showToast("Manual time deleted.");
   } catch (err) {
     console.error("Failed to delete manual time:", err);

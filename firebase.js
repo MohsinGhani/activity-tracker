@@ -104,6 +104,7 @@ export async function endSession(
   idleTime,
   endTime,
   startTime,
+  segments,
 ) {
   return updateDoc(doc(db, "sessions", sessionId), {
     startTime,
@@ -111,7 +112,16 @@ export async function endSession(
     duration,
     idleTime,
     status: "ended",
+    ...(Array.isArray(segments) ? { segments } : {}),
   });
+}
+
+// The session's active/idle blocks so far ([{ k: "a" | "i", s, e }], ms),
+// so manual time can replace the exact minutes it covers (INC-192).
+export function saveSessionSegments(sessionId, segments) {
+  return updateDoc(doc(db, "sessions", sessionId), { segments }).catch((err) =>
+    console.error("Failed to save session blocks:", err),
+  );
 }
 
 function toDateOrNull(value) {
@@ -186,6 +196,7 @@ export async function getTodaySessionsSummary(userId, dayStart, dayEnd) {
       duration: normalizedDuration,
       endedSecondsForToday,
       idleSecondsForToday,
+      segments: Array.isArray(data?.segments) ? data.segments : null,
       startTime: startDate,
       endTime: endDate,
     });

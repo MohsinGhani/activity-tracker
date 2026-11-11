@@ -27,9 +27,9 @@ export async function createSession(userId) {
   await gate("createSession");
   return id;
 }
-export async function endSession(id, duration, idleTime, endTime, startTime) {
+export async function endSession(id, duration, idleTime, endTime, startTime, segments) {
   await gate("endSession");
-  Object.assign(fb().sessions[id], { duration, idleTime, endTime, startTime, status: "ended" });
+  Object.assign(fb().sessions[id], { duration, idleTime, endTime, startTime, status: "ended", ...(segments ? { segments } : {}) });
 }
 export async function updateUserStatus(id, status) { if (fb().sessions[id]) fb().sessions[id].status = status; }
 export async function getTodaySessionsSummary() { return { totalEndedSeconds: 0, totalIdleSeconds: 0, sessions: [] }; }
@@ -38,8 +38,10 @@ export function watchTrackerSettings(userId, onChange) { onChange({ ...TRACKER_S
 export async function getManualTimeForDay() { return []; }
 export async function addManualTime() { return "m1"; }
 export async function deleteManualTime() {}
+export async function saveSessionSegments(id, segments) { if (fb().sessions[id]) fb().sessions[id].segments = segments; }
 `);
 fs.writeFileSync(path.join(dir, "screenshotStorage.js"), "export async function uploadScreenshot() { return {}; }");
+fs.copyFileSync(new URL("../manualOverride.js", import.meta.url), path.join(dir, "manualOverride.js"));
 
 console.log = () => {};
 console.error = () => {};
@@ -248,4 +250,48 @@ test("F: the admin's screenshot interval is used (every 5 min instead of 10)", a
 
   // One screenshot per 5-minute block: about 12 in an hour (10-min blocks give 6).
   assert.ok(fb.shots >= 11 && fb.shots <= 13, `expected ~12 screenshot attempts, got ${fb.shots}`);
+});
+
+test("G: a session saves its active/idle blocks (idle starts at the last input)", async () => {
+  reset();
+  fb.lastInputMs = at(19, 9);
+  const app = await launch(at(19, 9));
+  await app.click("start-btn");
+  await advance(1 * H, { working: true });       // 09:00-10:00 active
+  await advance(30 * MIN, { working: false });   // 10:00-10:30 away (idle after 15 min, backdated)
+  await advance(30 * MIN, { working: true });    // 10:30-11:00 active
+  await app.click("end-btn");
+
+  const [s1] = sessions();
+  const blocks = (s1.segments || []).map((b) => b.k + Math.round((b.e - b.s) / MIN));
+  assert.equal(s1.segments?.[0]?.k, "a");
+  const idle = s1.segments.filter((b) => b.k === "i").reduce((n, b) => n + (b.e - b.s), 0);
+  const active = s1.segments.filter((b) => b.k === "a").reduce((n, b) => n + (b.e - b.s), 0);
+  assert.ok(Math.abs(idle - 30 * MIN) <= 1 * MIN, `idle blocks ${blocks.join(",")}`);
+  assert.ok(Math.abs(active - 90 * MIN) <= 1 * MIN, `active blocks ${blocks.join(",")}`);
+});
+
+test("H: manual time replaces the tracked minutes it covers, whatever they were", async () => {
+  const { applyManualOverride } = await import(new URL("../manualOverride.js", import.meta.url).href);
+  // Tracker 13:00-17:00; idle 14:00-14:20 and 14:30-15:00 (mouse moved 14:20-14:30), idle 15:45-16:00.
+  const t = (h, m = 0) => Date.UTC(2026, 10, 11, h, m);
+  const segments = [
+    { k: "a", s: t(13), e: t(14) }, { k: "i", s: t(14), e: t(14, 20) }, { k: "a", s: t(14, 20), e: t(14, 30) },
+    { k: "i", s: t(14, 30), e: t(15) }, { k: "a", s: t(15), e: t(15, 45) }, { k: "i", s: t(15, 45), e: t(16) },
+    { k: "a", s: t(16), e: t(17) },
+  ];
+  const r = applyManualOverride([{ start: t(13), end: t(17), segments }], [{ start: t(14), end: t(15) }]);
+  assert.equal(r.idleCut, 50 * MIN);
+  assert.equal(r.activeCut, 10 * MIN);
+  assert.deepEqual(r.replaced, [{ activeMs: 10 * MIN, idleMs: 50 * MIN }]);
+
+  // Partly outside tracked time: only the overlapping half replaces anything.
+  const r2 = applyManualOverride([{ start: t(13), end: t(17), segments }], [{ start: t(12, 30), end: t(13, 30) }]);
+  assert.equal(r2.activeCut, 30 * MIN);
+  assert.equal(r2.idleCut, 0);
+
+  // Older session without blocks: split by its idle share (1h idle of 4h).
+  const r3 = applyManualOverride([{ start: t(13), end: t(17), activeMs: 180 * MIN, idleMs: 60 * MIN }], [{ start: t(14), end: t(15) }]);
+  assert.equal(Math.round(r3.idleCut / MIN), 15);
+  assert.equal(Math.round(r3.activeCut / MIN), 45);
 });
