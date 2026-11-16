@@ -1,6 +1,6 @@
 {
   "name": "employee-tracker",
-  "version": "1.0.6",
+  "version": "1.0.7",
   "description": "Employee activity tracker with screenshot monitoring",
   "main": "main.js",
   "scripts": {
