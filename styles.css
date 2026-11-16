@@ -737,9 +737,14 @@ body {
   justify-content: center;
 }
 
-.manual-item-delete:hover {
+.manual-item-delete:hover:not(:disabled) {
   color: var(--danger-hover);
   background: rgba(228, 59, 0, 0.12);
+}
+
+.manual-item-delete:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
 }
 
 .manual-empty {
@@ -808,6 +813,12 @@ body {
 
 .manual-field input:focus {
   border-color: var(--accent);
+}
+
+/* Time fields are clicked to pick a time, so they show the hand cursor. */
+.manual-field input[type="time"],
+.manual-field input[type="time"]::-webkit-calendar-picker-indicator {
+  cursor: pointer;
 }
 
 .manual-preview {
