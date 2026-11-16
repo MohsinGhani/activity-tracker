@@ -13,6 +13,7 @@ import {
   addManualTime,
   deleteManualTime,
   saveSessionSegments,
+  watchRemovedTimeForDay,
 } from "./firebase.js";
 import { uploadScreenshot } from "./screenshotStorage.js";
 import { applyManualOverride, mergeWindows } from "./manualOverride.js";
@@ -1173,9 +1174,13 @@ function renderTodayTotalTime() {
   const { activeCut, idleCut } = getManualOverrideCuts();
   const currentSessionWorkMs = Math.max(0, getElapsedMs() - trackedIdleMs);
   const currentSessionSeconds = Math.floor(currentSessionWorkMs / 1000);
+  ensureRemovedTimeWatch();
   const totalSeconds = Math.max(
     0,
-    todayEndedSeconds + currentSessionSeconds - Math.floor(activeCut / 1000),
+    todayEndedSeconds +
+      currentSessionSeconds -
+      Math.floor(activeCut / 1000) -
+      Math.floor(removedTodayMs / 1000),
   );
   const h = Math.floor(totalSeconds / 3600);
   const m = Math.floor((totalSeconds % 3600) / 60);
@@ -1359,6 +1364,9 @@ function stopIdlePoll() {
   idlePollInterval = null;
 }
 
+// The block the next screenshot belongs to, saved with it (INC-222).
+let nextScreenshotBlock = null;
+
 function scheduleNextScreenshot() {
   if (screenshotTimeout) clearTimeout(screenshotTimeout);
   if (isSessionPaused) {
@@ -1382,6 +1390,10 @@ function scheduleNextScreenshot() {
   const targetElapsed = minOffset + Math.floor(Math.random() * randWindow);
 
   const delay = Math.max(0, targetElapsed - nowElapsed);
+  nextScreenshotBlock = {
+    blockStartElapsedMs: targetBlockStart,
+    blockEndElapsedMs: targetBlockStart + blockMs,
+  };
   screenshotTimeout = setTimeout(captureAndUpload, delay);
 }
 
@@ -1678,6 +1690,7 @@ function normalizeCapturedScreens(captureResult) {
 
 async function captureAndUpload() {
   if (!currentSessionId || !currentUser || isSessionPaused) return;
+  const block = nextScreenshotBlock;
 
   try {
     const captureResult = await window.tracker.takeScreenshot();
@@ -1737,6 +1750,7 @@ async function captureAndUpload() {
         screenCount: capturedScreens.length,
         screenSummaries,
       },
+      block,
     );
 
     const timeStr = now.toLocaleTimeString("en-US", {
@@ -1958,9 +1972,38 @@ function getPkDateString(date = new Date()) {
 function startTrackerSettingsWatch(userId) {
   stopTrackerSettingsWatch();
   stopSettingsWatch = watchTrackerSettings(userId, applyTrackerSettings);
+  ensureRemovedTimeWatch();
+}
+
+// Active time removed today by deleted screenshots (INC-222), kept live so the
+// Today total drops as soon as a screenshot is deleted in the portal.
+let removedTodayMs = 0;
+let removedWatchDate = null;
+let stopRemovedWatch = null;
+
+function stopRemovedTimeWatch() {
+  if (stopRemovedWatch) stopRemovedWatch();
+  stopRemovedWatch = null;
+  removedWatchDate = null;
+  removedTodayMs = 0;
+}
+
+// Starts the watch, or moves it to the new day after midnight.
+function ensureRemovedTimeWatch() {
+  if (!currentUser) return;
+  const today = getPkDateString();
+  // Set before starting: the first answer can arrive straight away and render.
+  if (removedWatchDate === today) return;
+  stopRemovedTimeWatch();
+  removedWatchDate = today;
+  stopRemovedWatch = watchRemovedTimeForDay(currentUser.uid, today, (ms) => {
+    removedTodayMs = ms;
+    renderTodayTotalTime();
+  });
 }
 
 function stopTrackerSettingsWatch() {
+  stopRemovedTimeWatch();
   if (stopSettingsWatch) stopSettingsWatch();
   stopSettingsWatch = null;
   trackerSettings = { ...TRACKER_SETTINGS_DEFAULTS };
