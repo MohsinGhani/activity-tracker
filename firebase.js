@@ -66,12 +66,16 @@ export function onAuthChange(callback) {
 }
 
 // `image` = where the files live, e.g. { storage: "s3", s3Path }.
+// `block` = the screenshot block it was taken in, in tracked time (ms since the
+// session started, pauses excluded). The portal uses it when the screenshot is
+// deleted, to remove that block's active time (INC-222).
 export async function saveScreenshot(
   sessionId,
   userId,
   image,
   timestamp,
   activityContext = {},
+  block = null,
 ) {
   const hasScreenSummaries =
     Array.isArray(activityContext.screenSummaries) &&
@@ -85,6 +89,16 @@ export async function saveScreenshot(
     activitySummary: activityContext.summary || "Unknown activity",
     createdAt: serverTimestamp(),
   };
+  if (
+    block &&
+    Number.isFinite(block.blockStartElapsedMs) &&
+    Number.isFinite(block.blockEndElapsedMs) &&
+    block.blockEndElapsedMs > block.blockStartElapsedMs
+  ) {
+    screenshotDoc.blockStartElapsedMs = block.blockStartElapsedMs;
+    screenshotDoc.blockEndElapsedMs = block.blockEndElapsedMs;
+    screenshotDoc.blockMs = block.blockEndElapsedMs - block.blockStartElapsedMs;
+  }
 
   return addDoc(collection(db, "screenshots"), screenshotDoc);
 }
@@ -250,6 +264,32 @@ export function watchTrackerSettings(userId, onChange) {
     (error) => {
       console.error("Failed to load tracker settings:", error);
       onChange({ ...TRACKER_SETTINGS_DEFAULTS });
+    },
+  );
+}
+
+// ─── Time removed by deleted screenshots (INC-222) ──────────────────────────
+// The portal saves one removedTime record per deleted screenshot, with the
+// active time it removed and the session's Pakistan date. Calls onChange with
+// the day's total (ms) now and whenever a screenshot is deleted. Returns a
+// function that stops listening.
+export function watchRemovedTimeForDay(userId, date, onChange) {
+  return onSnapshot(
+    query(
+      collection(db, "removedTime"),
+      where("userId", "==", userId),
+      where("date", "==", date),
+    ),
+    (snapshot) =>
+      onChange(
+        snapshot.docs.reduce(
+          (total, item) => total + Math.max(0, Number(item.data().activeMs) || 0),
+          0,
+        ),
+      ),
+    (error) => {
+      console.error("Failed to load removed time:", error);
+      onChange(0);
     },
   );
 }

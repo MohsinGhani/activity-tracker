@@ -20,7 +20,7 @@ const gate = async (op) => { while (fb().hold.has(op)) await new Promise((r) => 
 export async function loginUser() {}
 export async function logoutUser() {}
 export function onAuthChange(cb) { fb().authCb = cb; return () => {}; }
-export async function saveScreenshot() {}
+export async function saveScreenshot(...args) { (fb().saved ||= []).push(args); }
 export async function createSession(userId) {
   const id = "s" + ++fb().n;
   fb().sessions[id] = { userId, status: "active", startTime: new Date() };
@@ -39,11 +39,14 @@ export async function getManualTimeForDay() { return []; }
 export async function addManualTime() { return "m1"; }
 export async function deleteManualTime() {}
 export async function saveSessionSegments(id, segments) { if (fb().sessions[id]) fb().sessions[id].segments = segments; }
+export function watchRemovedTimeForDay(userId, date, onChange) { fb().removedCb = onChange; onChange(fb().removedMs || 0); return () => {}; }
 `);
 fs.writeFileSync(path.join(dir, "screenshotStorage.js"), "export async function uploadScreenshot() { return {}; }");
 fs.copyFileSync(new URL("../manualOverride.js", import.meta.url), path.join(dir, "manualOverride.js"));
 
 console.log = () => {};
+// Images "load" straight away.
+globalThis.Image = class { set src(_) { setImmediate(() => this.onload?.()); } };
 console.error = () => {};
 globalThis.requestAnimationFrame = () => {};
 
@@ -57,6 +60,9 @@ function fakeElement() {
     classList: { add() {}, remove() {}, toggle() {}, contains: () => false },
     addEventListener(type, fn) { this.handlers[type] = fn; },
     appendChild() {}, remove() {},
+    // Enough of a canvas for a screenshot to be "encoded".
+    getContext: () => ({ drawImage() {} }),
+    toBlob: (cb) => cb({ size: 1 }),
   };
 }
 
@@ -77,7 +83,12 @@ async function launch(atMs) {
       storeGet: async (k) => fb.store.get(k) ?? null,
       storeSet: async (k, v) => { if (v == null) fb.store.delete(k); else fb.store.set(k, v); },
       getIdleTime: async () => Math.floor((Date.now() - fb.lastInputMs) / 1000),
-      takeScreenshot: async () => { fb.shots = (fb.shots || 0) + 1; throw new Error("no screens in test"); },
+      takeScreenshot: async () => {
+        fb.shots = (fb.shots || 0) + 1;
+        if (!fb.captureOk) throw new Error("no screens in test");
+        return [{ dataUrl: "data:image/png;base64,AA", width: 100, height: 50, screenName: "Screen 1" }];
+      },
+      getActivityContexts: async () => ({ active: { summary: "Test app" }, perScreen: [] }),
       showNotification: async () => {},
       logEvent: async () => {},
       onUpdateStatus() {}, onDiagnostic() {}, onAppClosing() {},
@@ -316,4 +327,34 @@ test("I: deleting manual time gives the tracked minutes back; overlapping entrie
   const both = applyManualOverride([session], merged);
   assert.equal(both.idleCut, 60 * MIN);
   assert.equal(both.activeCut, 30 * MIN);
+});
+
+test("J: each screenshot saves the block it was taken in (INC-222)", async () => {
+  reset();
+  fb.captureOk = true;
+  fb.lastInputMs = at(21, 9);
+  const app = await launch(at(21, 9));
+  await app.click("start-btn");
+  await advance(35 * MIN, { working: true });
+  await app.click("end-btn");
+
+  const blocks = (fb.saved || []).map((args) => args[5]);
+  assert.ok(blocks.length >= 3, `expected 3 screenshots, got ${blocks.length}`);
+  blocks.forEach((b, i) => {
+    assert.equal(b.blockEndElapsedMs - b.blockStartElapsedMs, 10 * MIN);
+    assert.equal(b.blockStartElapsedMs, i * 10 * MIN);
+  });
+});
+
+test("K: Today's total drops as soon as a screenshot's time is removed (INC-222)", async () => {
+  reset();
+  fb.lastInputMs = at(22, 9);
+  const app = await launch(at(22, 9));
+  await app.click("start-btn");
+  await advance(30 * MIN, { working: true });
+  const before = app.els["today-total-time"].textContent;
+  assert.match(before, /^00h 30m/);
+  fb.removedCb(10 * MIN); // the portal deleted a screenshot: 10 min of active time removed
+  await flush();
+  assert.match(app.els["today-total-time"].textContent, /^00h 20m/);
 });
