@@ -248,7 +248,7 @@ function requestSessionEndBeforeQuit(timeoutMs = 20000) {
   });
 }
 
-async function runPreQuitFlow() {
+async function runPreQuitFlow(timeoutMs = 20000) {
   if (hasHandledPreQuit || isCloseFlowInProgress) {
     return;
   }
@@ -265,7 +265,7 @@ async function runPreQuitFlow() {
   }
 
   try {
-    await requestSessionEndBeforeQuit();
+    await requestSessionEndBeforeQuit(timeoutMs);
   } catch (error) {
     console.error("Failed to end session before quit:", error);
   } finally {
@@ -1143,17 +1143,18 @@ for (const eventName of [
   powerMonitor.on(eventName, () => sendPowerMonitorEvent(eventName));
 }
 
+// macOS and Linux: ask the system to wait while the session is ended at the
+// shutdown time, then quit. (This used to mark the quit as handled before
+// running it, so the session was never ended and the app just quit.)
+// Windows has no such event in this Electron version; there the heartbeat
+// covers it, and the next start writes the final end.
+const SHUTDOWN_SAVE_TIMEOUT_MS = 8000;
 powerMonitor.on("shutdown", (event) => {
   if (app.isQuitting || hasHandledPreQuit || isCloseFlowInProgress) {
     return;
   }
 
+  event.preventDefault();
   store.set("pendingSessionEndAtMs", Date.now());
-  hasHandledPreQuit = true;
-
-  void runPreQuitFlow().finally(() => {
-    if (!app.isQuitting) {
-      app.quit();
-    }
-  });
+  void runPreQuitFlow(SHUTDOWN_SAVE_TIMEOUT_MS);
 });

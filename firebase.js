@@ -130,6 +130,16 @@ export async function endSession(
   });
 }
 
+// Heartbeat: the tracker is alive and this session is open. Saves the server
+// time and the blocks so far. If the PC shuts down or the app dies, the portal
+// ends the session at its last heartbeat after 10 minutes of silence.
+export function saveSessionHeartbeat(sessionId, segments) {
+  return updateDoc(doc(db, "sessions", sessionId), {
+    lastSeenAt: serverTimestamp(),
+    segments,
+  }).catch((err) => console.error("Failed to save heartbeat:", err));
+}
+
 // The session's active/idle blocks so far ([{ k: "a" | "i", s, e }], ms),
 // so manual time can replace the exact minutes it covers (INC-192).
 export function saveSessionSegments(sessionId, segments) {
