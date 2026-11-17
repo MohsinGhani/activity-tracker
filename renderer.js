@@ -13,6 +13,7 @@ import {
   addManualTime,
   deleteManualTime,
   saveSessionSegments,
+  saveSessionHeartbeat,
   watchRemovedTimeForDay,
 } from "./firebase.js";
 import { uploadScreenshot } from "./screenshotStorage.js";
@@ -80,6 +81,16 @@ function currentSegments(nowMs = Date.now()) {
 function syncSegments() {
   if (currentSessionId) void saveSessionSegments(currentSessionId, currentSegments());
 }
+
+// Heartbeat every 2 minutes while a session is open: running, idle or paused.
+// When the PC shuts down, the battery dies or the app is killed, the beats
+// stop and the portal shows the session as ended at the last one (after 10
+// minutes of silence) instead of running until the app starts again.
+const HEARTBEAT_MS = 2 * 60 * 1000;
+function sendHeartbeat() {
+  if (currentSessionId) void saveSessionHeartbeat(currentSessionId, currentSegments());
+}
+setInterval(sendHeartbeat, HEARTBEAT_MS);
 let idleStartedAtMs = null;
 let isAppClosingHandled = false;
 let autoRestartInProgress = false;
@@ -1816,6 +1827,8 @@ async function prefillRememberedEmail() {
 }
 
 function setActiveUI() {
+  // Started, resumed or restored: tell the portal straight away.
+  sendHeartbeat();
   statusText.textContent = "Session active";
   statusText.className = "status-text active";
   startBtn.style.display = "none";

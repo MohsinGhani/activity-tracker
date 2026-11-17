@@ -39,6 +39,10 @@ export async function getManualTimeForDay() { return []; }
 export async function addManualTime() { return "m1"; }
 export async function deleteManualTime() {}
 export async function saveSessionSegments(id, segments) { if (fb().sessions[id]) fb().sessions[id].segments = segments; }
+export async function saveSessionHeartbeat(id, segments) {
+  (fb().beats ||= []).push({ id, at: Date.now() });
+  if (fb().sessions[id]) Object.assign(fb().sessions[id], { lastSeenAt: Date.now(), segments });
+}
 export function watchRemovedTimeForDay(userId, date, onChange) { fb().removedCb = onChange; onChange(fb().removedMs || 0); return () => {}; }
 `);
 fs.writeFileSync(path.join(dir, "screenshotStorage.js"), "export async function uploadScreenshot() { return {}; }");
@@ -357,4 +361,52 @@ test("K: Today's total drops as soon as a screenshot's time is removed (INC-222)
   fb.removedCb(10 * MIN); // the portal deleted a screenshot: 10 min of active time removed
   await flush();
   assert.match(app.els["today-total-time"].textContent, /^00h 20m/);
+});
+
+test("L: a heartbeat every 2 minutes while a session is open, paused too; none after it ends", async () => {
+  reset();
+  fb.lastInputMs = at(23, 9);
+  const app = await launch(at(23, 9));
+  await app.click("start-btn");
+  const [{ id }] = sessions();
+  // One straight away on start, then every 2 minutes.
+  assert.equal(fb.beats.filter((b) => b.id === id).length, 1);
+  await advance(10 * MIN, { working: true });
+  assert.equal(fb.beats.filter((b) => b.id === id).length, 6);
+  assert.ok(Date.now() - fb.sessions[id].lastSeenAt < 2 * MIN);
+  // The saved blocks reach the last heartbeat.
+  const blocks = fb.sessions[id].segments;
+  assert.equal(blocks[blocks.length - 1].e, fb.sessions[id].lastSeenAt);
+
+  // Paused: the app is alive, so beats go on (the portal keeps it open).
+  await app.click("stop-btn");
+  const paused = fb.beats.length;
+  await advance(6 * MIN, { working: false });
+  assert.equal(fb.beats.length - paused, 3);
+
+  // Ended: no more beats for that session.
+  await app.click("end-btn");
+  assert.equal(fb.sessions[id].status, "ended");
+  const ended = fb.beats.filter((b) => b.id === id).length;
+  await advance(10 * MIN, { working: false });
+  assert.equal(fb.beats.filter((b) => b.id === id).length, ended);
+});
+
+test("L: after a shutdown, beats stop at the last one and the next start ends the session there", async () => {
+  reset();
+  fb.lastInputMs = at(24, 9);
+  const app = await launch(at(24, 9));
+  await app.click("start-btn");
+  const [{ id }] = sessions();
+  await advance(61 * MIN, { working: true }); // the PC is switched off at 10:01
+  const lastBeat = fb.sessions[id].lastSeenAt;
+  assert.ok(at(24, 10) - lastBeat <= 0 && at(24, 10, 1) - lastBeat < 2 * MIN);
+
+  // Next morning the app starts and writes the real end, close to the last beat.
+  const app2 = await launch(at(25, 8));
+  await advance(30e3, { working: false });
+  const s = fb.sessions[id];
+  assert.equal(s.status, "ended");
+  assert.ok(Math.abs(s.endTime - at(24, 10, 1)) < 1 * MIN, `ended at ${new Date(s.endTime).toTimeString()}`);
+  await app2.click("end-btn");
 });
