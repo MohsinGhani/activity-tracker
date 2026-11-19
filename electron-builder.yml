@@ -40,9 +40,20 @@ nsis:
   createStartMenuShortcut: true
 
 mac:
+  # One "universal" app that runs on both Intel Macs and Apple chip (M1 and
+  # later) Macs. The build machine is an Apple chip Mac, so without this the
+  # app was built for Apple chips only and Intel Macs refused to open it
+  # ("not supported on this Mac"). The window helper (get-windows /
+  # active-win "main") is already universal.
   target:
-    - dmg
-    - zip
+    - target: dmg
+      arch: universal
+    - target: zip
+      arch: universal
+  # Prebuilt per-chip bindings that ship in both halves unchanged (the Mac app
+  # uses the universal "main" helper, not these). Without this the universal
+  # merge stops on them.
+  x64ArchFiles: "Contents/Resources/app.asar.unpacked/node_modules/{active-win,get-windows}/lib/binding/**/*.node"
   icon: assets/icon.icns
   # Hardened runtime enforces library validation, which makes the app refuse to
   # spawn/load the ad-hoc-signed active-win native helper (node_modules/active-win/main

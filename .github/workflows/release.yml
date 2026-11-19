@@ -92,6 +92,17 @@ jobs:
             exit 1
           }
 
+      - name: Verify the app runs on both Intel and Apple chip Macs
+        run: |
+          APP="$(ls -d release/mac*/*.app | head -1)"
+          BIN="$APP/Contents/MacOS/$(defaults read "$PWD/$APP/Contents/Info" CFBundleExecutable)"
+          ARCHS="$(lipo -archs "$BIN")"
+          echo "$BIN: $ARCHS"
+          case "$ARCHS" in
+            *x86_64*arm64*|*arm64*x86_64*) ;;
+            *) echo "::error::$APP is not universal ($ARCHS); Intel or Apple chip Macs could not open it."; exit 1 ;;
+          esac
+
   release_linux:
     runs-on: ubuntu-latest
     steps:
