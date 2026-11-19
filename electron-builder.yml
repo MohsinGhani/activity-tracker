@@ -50,10 +50,11 @@ mac:
       arch: universal
     - target: zip
       arch: universal
-  # Prebuilt per-chip bindings that ship in both halves unchanged (the Mac app
-  # uses the universal "main" helper, not these). Without this the universal
-  # merge stops on them.
-  x64ArchFiles: "Contents/Resources/app.asar.unpacked/node_modules/{active-win,get-windows}/lib/binding/**/*.node"
+  # Per-chip native bindings of the window helpers (prebuilt ones in
+  # lib/binding, and the one npm compiles at install in build/Release). They
+  # ship in both halves unchanged; the Mac app uses the universal "main"
+  # helper, not these. Without this the universal merge stops on them.
+  x64ArchFiles: "Contents/Resources/app.asar.unpacked/node_modules/{active-win,get-windows}/**/*.node"
   icon: assets/icon.icns
   # Hardened runtime enforces library validation, which makes the app refuse to
   # spawn/load the ad-hoc-signed active-win native helper (node_modules/active-win/main
