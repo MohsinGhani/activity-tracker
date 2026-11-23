@@ -14,10 +14,19 @@ import {
   deleteManualTime,
   saveSessionSegments,
   saveSessionHeartbeat,
+  saveSessionTask,
   watchRemovedTimeForDay,
 } from "./firebase.js";
 import { uploadScreenshot } from "./screenshotStorage.js";
 import { applyManualOverride, mergeWindows } from "./manualOverride.js";
+import { createTicketPicker } from "./ticketPicker.js";
+import {
+  dayKey,
+  pickTicketFields,
+  STALE_MS,
+  taskSnapshot,
+  ticketChanged,
+} from "./tickets.js";
 
 let currentUser = null;
 let currentSessionId = null;
@@ -42,16 +51,40 @@ let todaySessions = [];
 // Today's manual time entries: [{ id, start: Date, end: Date, minutes, note }].
 let manualEntries = [];
 
+// The Linear ticket being worked on ("Working on" menu). Required to Start.
+// { uid, id, identifier, title, url, status, project, group, pickedDay };
+// kept in the store until logout, and dropped the next day once no session
+// is running. ticketList is the last list loaded from the portal.
+let selectedTicket = null;
+let ticketList = { uid: null, tickets: [], fetchedAtMs: null };
+let ticketsLoading = false;
+let ticketsError = null;
+let deviceId = null;
+let appVersion = null;
+// The ticket the running session last recorded (sessions/{id}.taskId).
+let sessionTaskId = null;
+
 // Active/idle blocks of the current session, so manual time can replace the
-// exact minutes it covers: [{ k: "a" | "i", s, e }] in ms. Paused time has no
-// block. Saved with the session (sessions/{id}.segments).
+// exact minutes it covers: [{ k: "a" | "i", s, e, t }] in ms. `t` is the
+// Linear ticket (issue id) the block was worked on; picking another ticket
+// starts a new block. Paused time has no block. Saved with the session
+// (sessions/{id}.segments).
 let segmentLog = [];
 let openSegment = null;
+
+const currentTaskId = () => selectedTicket?.id || null;
 
 function closeSegment(endMs) {
   if (!openSegment) return;
   const e = Math.max(openSegment.s, Math.round(endMs));
-  if (e > openSegment.s) segmentLog.push({ k: openSegment.k, s: openSegment.s, e });
+  if (e > openSegment.s) {
+    segmentLog.push({
+      k: openSegment.k,
+      s: openSegment.s,
+      e,
+      ...(openSegment.t ? { t: openSegment.t } : {}),
+    });
+  }
   openSegment = null;
 }
 
@@ -63,7 +96,8 @@ function openSegmentAt(kind, startMs) {
     s = Math.max(s, openSegment.s);
     closeSegment(s);
   }
-  openSegment = { k: kind, s };
+  const t = currentTaskId();
+  openSegment = t ? { k: kind, s, t } : { k: kind, s };
 }
 
 function beginSegments(startMs) {
@@ -74,7 +108,7 @@ function beginSegments(startMs) {
 
 function currentSegments(nowMs = Date.now()) {
   return openSegment
-    ? [...segmentLog, { k: openSegment.k, s: openSegment.s, e: Math.max(openSegment.s, nowMs) }]
+    ? [...segmentLog, { ...openSegment, e: Math.max(openSegment.s, nowMs) }]
     : [...segmentLog];
 }
 
@@ -136,6 +170,11 @@ const rememberCheckbox = document.getElementById("remember-me");
 const diagnostics = document.getElementById("diagnostics");
 const diagnosticsText = document.getElementById("diagnostics-text");
 const openLogBtn = document.getElementById("open-log-btn");
+const picker = createTicketPicker({
+  onPick: (ticket) => void pickTicket(ticket),
+  onReload: () => void loadTickets({ force: true }),
+  onOpen: () => void loadTickets(),
+});
 let updateIsReadyToInstall = false;
 let permissionCheckInProgress = false;
 
@@ -252,10 +291,189 @@ if (window.tracker.onDiagnostic) {
 function resetStuckButtons() {
   try {
     if (!currentSessionId && startBtn && startBtn.disabled) {
-      startBtn.disabled = false;
-      startBtn.textContent = "▶ Start Session";
+      resetStartButton();
     }
   } catch (_) {}
+}
+
+// ─── Working on: the Linear ticket ──────────────────────────────────────────
+// Start needs a ticket; without one the button opens the menu.
+function resetStartButton() {
+  startBtn.disabled = false;
+  startBtn.textContent = selectedTicket
+    ? "▶ Start Session"
+    : "Choose a ticket to start";
+}
+
+function renderTicketPicker() {
+  picker.update({
+    tickets: ticketList.tickets,
+    selected: selectedTicket,
+    fetchedAtMs: ticketList.fetchedAtMs,
+    loading: ticketsLoading,
+    error: ticketsError,
+    required: !selectedTicket && !currentSessionId,
+  });
+}
+
+function saveSelectedTicket() {
+  return window.tracker.storeSet("selectedTicket", selectedTicket);
+}
+
+// What a new session records: this computer, the tracker version, and the
+// ticket it starts on. A session today keeps today's pick.
+function sessionMeta() {
+  if (selectedTicket) {
+    selectedTicket.pickedDay = dayKey(Date.now());
+    void saveSelectedTicket();
+  }
+  sessionTaskId = selectedTicket?.id || null;
+  return {
+    deviceId,
+    appVersion,
+    task: selectedTicket
+      ? { id: selectedTicket.id, snapshot: taskSnapshot(selectedTicket, Date.now()) }
+      : null,
+  };
+}
+
+async function pickTicket(ticket) {
+  if (!currentUser) return;
+  const next = {
+    uid: currentUser.uid,
+    ...pickTicketFields(ticket),
+    pickedDay: dayKey(Date.now()),
+  };
+  selectedTicket = next;
+  await saveSelectedTicket();
+  renderTicketPicker();
+  if (!currentSessionId) {
+    // While a session is being created, setActiveUI syncs the pick after.
+    if (!startBtn.disabled) resetStartButton();
+    return;
+  }
+  await syncSessionTask();
+}
+
+// Makes the running session follow the picked ticket. Running or idle: the
+// open block ends now and a new one starts on the ticket. Paused: there is
+// no open block; Resume starts one on it. One write, only on a change.
+async function syncSessionTask({ force = false } = {}) {
+  if (!currentSessionId || !selectedTicket) return;
+  if (!force && sessionTaskId === selectedTicket.id) return;
+  sessionTaskId = selectedTicket.id;
+  if (openSegment && openSegment.t !== selectedTicket.id) {
+    openSegmentAt(openSegment.k, Date.now());
+  }
+  void persistSessionState();
+  try {
+    await saveSessionTask(
+      currentSessionId,
+      selectedTicket.id,
+      taskSnapshot(selectedTicket, Date.now()),
+      currentSegments(),
+    );
+  } catch (err) {
+    console.error("Failed to save the ticket on the session:", err);
+  }
+}
+
+// The open tickets from Linear, through the portal. Only reloads when asked
+// (reload icon), at sign-in, or when the menu opens on an old list.
+async function loadTickets({ force = false } = {}) {
+  const user = currentUser;
+  if (!user || ticketsLoading) return;
+  // Opening the menu reloads only an old list; after a failed load the menu
+  // shows why, and "Try again" or the reload icon retries.
+  const lastTry = ticketsError?.atMs || ticketList.fetchedAtMs;
+  if (!force && lastTry && Date.now() - lastTry < STALE_MS) return;
+
+  ticketsLoading = true;
+  renderTicketPicker();
+  let res;
+  try {
+    const token =
+      typeof user.getIdToken === "function" ? await user.getIdToken() : "";
+    res = await window.tracker.getLinearTickets(token);
+  } catch (err) {
+    res = { ok: false, code: "offline", message: err?.message || "" };
+  }
+  ticketsLoading = false;
+  if (currentUser?.uid !== user.uid) return; // signed out meanwhile
+
+  if (res?.ok) {
+    ticketList = {
+      uid: user.uid,
+      tickets: (res.tickets || []).map(pickTicketFields),
+      fetchedAtMs: Date.now(),
+    };
+    ticketsError = null;
+    void window.tracker.storeSet("linearTickets", ticketList);
+    await followSelectedTicket();
+  } else {
+    ticketsError = {
+      code: res?.code || "error",
+      message: res?.message || "",
+      atMs: Date.now(),
+    };
+    void window.tracker.logEvent?.(
+      "linear",
+      `tickets not loaded: ${ticketsError.code} ${ticketsError.message}`,
+    );
+  }
+  renderTicketPicker();
+}
+
+// A reload shows the picked ticket's newest title and status: the running
+// session's snapshot follows, so the portal shows the status it had that day.
+async function followSelectedTicket() {
+  if (!selectedTicket) return;
+  const latest = ticketList.tickets.find((t) => t.id === selectedTicket.id);
+  if (!latest || !ticketChanged(selectedTicket, latest)) return;
+  selectedTicket = { ...selectedTicket, ...latest };
+  await saveSelectedTicket();
+  await syncSessionTask({ force: true });
+}
+
+// At sign-in: this computer's id, the version, the saved list and the pick.
+// Yesterday's pick is dropped unless its session is still being restored.
+async function restoreTicketState(uid) {
+  deviceId = await window.tracker.storeGet("deviceId");
+  if (!deviceId) {
+    deviceId = crypto.randomUUID();
+    await window.tracker.storeSet("deviceId", deviceId);
+  }
+  try {
+    appVersion = (await window.tracker.getAppVersion?.()) || null;
+  } catch (_) {
+    appVersion = null;
+  }
+  const cached = await window.tracker.storeGet("linearTickets");
+  ticketList =
+    cached?.uid === uid && Array.isArray(cached.tickets)
+      ? cached
+      : { uid, tickets: [], fetchedAtMs: null };
+  ticketsError = null;
+  const saved = await window.tracker.storeGet("selectedTicket");
+  const hasSession =
+    (await window.tracker.storeGet("sessionUserId")) === uid &&
+    !!(await window.tracker.storeGet("sessionId"));
+  selectedTicket =
+    saved?.uid === uid &&
+    saved?.id &&
+    (hasSession || saved.pickedDay === dayKey(Date.now()))
+      ? saved
+      : null;
+  renderTicketPicker();
+}
+
+function forgetTickets() {
+  selectedTicket = null;
+  ticketList = { uid: null, tickets: [], fetchedAtMs: null };
+  ticketsError = null;
+  ticketsLoading = false;
+  picker.close();
+  renderTicketPicker();
 }
 
 window.addEventListener("unhandledrejection", (event) => {
@@ -499,7 +717,9 @@ onAuthChange(async (user) => {
       const freshAuthTimeMs = Date.now();
       await window.tracker.storeSet("authTimeMs", freshAuthTimeMs);
       showDashboard(user);
+      await restoreTicketState(user.uid);
       await restoreSession();
+      void loadTickets({ force: true });
       await refreshTodayEndedSeconds();
       renderTodayTotalTime();
       await checkMacOSPermissions();
@@ -508,7 +728,9 @@ onAuthChange(async (user) => {
 
     const authTimeMs = await ensureAuthTimeMs();
     showDashboard(user);
+    await restoreTicketState(user.uid);
     await restoreSession();
+    void loadTickets({ force: true });
     await refreshTodayEndedSeconds();
     renderTodayTotalTime();
     await checkMacOSPermissions();
@@ -516,6 +738,7 @@ onAuthChange(async (user) => {
     stopTrackerSettingsWatch();
     clearTimers();
     clearSessionState();
+    forgetTickets();
     todayEndedSeconds = 0;
     renderTodayTotalTime();
     showLogin();
@@ -575,7 +798,10 @@ logoutBtn.addEventListener("click", async () => {
     await window.tracker.storeSet("sessionIdleMs", null);
     await window.tracker.storeSet("sessionPaused", null);
     await window.tracker.storeSet("sessionPersistedAtMs", null);
+    await window.tracker.storeSet("sessionSegments", null);
     await window.tracker.storeSet("pendingSessionEndAtMs", null);
+    await window.tracker.storeSet("selectedTicket", null);
+    await window.tracker.storeSet("linearTickets", null);
   } catch (err) {
     console.error("Failed to clear session state on logout:", err);
   }
@@ -597,6 +823,17 @@ logoutBtn.addEventListener("click", async () => {
 
 startBtn.addEventListener("click", async () => {
   if (currentSessionId) return;
+  // A ticket is required, picked today (yesterday's pick isn't carried over).
+  if (!selectedTicket || selectedTicket.pickedDay !== dayKey(Date.now())) {
+    if (selectedTicket) {
+      selectedTicket = null;
+      void saveSelectedTicket();
+      renderTicketPicker();
+      resetStartButton();
+    }
+    picker.open();
+    return;
+  }
   startBtn.disabled = true;
   startBtn.textContent = "Starting\u2026";
   void window.tracker.logEvent?.("start", "Start clicked");
@@ -614,8 +851,7 @@ startBtn.addEventListener("click", async () => {
           ? "Permission check timed out \u2014 please try again."
           : "Could not verify permissions \u2014 please try again.",
       );
-      startBtn.disabled = false;
-      startBtn.textContent = "\u25b6 Start Session";
+      resetStartButton();
       return;
     }
     if (perm.needsRelaunch || perm.missing.length > 0) {
@@ -624,8 +860,7 @@ startBtn.addEventListener("click", async () => {
           ? "Relaunch required before starting \u2014 see the banner above."
           : `Can't start \u2014 grant: ${perm.missing.join(", ")}.`,
       );
-      startBtn.disabled = false;
-      startBtn.textContent = "\u25b6 Start Session";
+      resetStartButton();
       return;
     }
   }
@@ -637,7 +872,7 @@ startBtn.addEventListener("click", async () => {
     );
     const SESSION_TIMEOUT = Symbol("session-timeout");
     const sessionId = await withTimeout(
-      createSession(currentUser.uid),
+      createSession(currentUser.uid, sessionMeta()),
       15000,
       SESSION_TIMEOUT,
     );
@@ -681,8 +916,7 @@ startBtn.addEventListener("click", async () => {
     const friendly = err?.message || "check the console.";
     showToast(`Could not start session \u2014 ${friendly}`);
     showDiagnostic(friendly);
-    startBtn.disabled = false;
-    startBtn.textContent = "\u25B6 Start Session";
+    resetStartButton();
   }
 });
 
@@ -908,6 +1142,7 @@ async function restoreSession() {
     const storedSegments = await window.tracker.storeGet("sessionSegments");
     segmentLog = Array.isArray(storedSegments?.log) ? storedSegments.log : [];
     openSegment = storedSegments?.open ?? null;
+    sessionTaskId = openSegment?.t || segmentLog[segmentLog.length - 1]?.t || null;
 
     if (pendingSessionEndAtMs) {
       const endpointMs = Number.isFinite(lastPersistedAtMs)
@@ -976,7 +1211,7 @@ async function startNewSessionAfterRecovery() {
   try {
     const RECOVERY_TIMEOUT = Symbol("session-timeout");
     const sessionId = await withTimeout(
-      createSession(currentUser.uid),
+      createSession(currentUser.uid, sessionMeta()),
       15000,
       RECOVERY_TIMEOUT,
     );
@@ -1019,6 +1254,12 @@ async function rolloverSessionAfterMidnight() {
   const { duration: rolloverDuration, idleTime: rolloverIdleTime } =
     getSessionTotalsAt(rolloverEndTime.getTime());
 
+  const rolloverEndMs = rolloverEndTime.getTime();
+  closeSegment(rolloverEndMs);
+  const rolloverSegments = segmentLog
+    .filter((seg) => seg.s < rolloverEndMs)
+    .map((seg) => ({ ...seg, e: Math.min(seg.e, rolloverEndMs) }));
+
   try {
     await endSession(
       currentSessionId,
@@ -1026,6 +1267,7 @@ async function rolloverSessionAfterMidnight() {
       rolloverIdleTime,
       rolloverEndTime,
       new Date(sessionStartedAtMs),
+      rolloverSegments,
     );
   } catch (err) {
     console.error("Failed to close previous session at rollover:", err);
@@ -1034,7 +1276,7 @@ async function rolloverSessionAfterMidnight() {
   await clearStoredSession();
   clearSessionState();
 
-  const freshSessionId = await createSession(currentUser.uid);
+  const freshSessionId = await createSession(currentUser.uid, sessionMeta());
   currentSessionId = freshSessionId;
   sessionStartTime = Date.now();
   sessionStartedAtMs = sessionStartTime;
@@ -1490,7 +1732,7 @@ function scheduleNewSessionAtRollover(targetTimeMs = null) {
       );
       const ROLLOVER_TIMEOUT = Symbol("session-timeout");
       const sessionId = await withTimeout(
-        createSession(currentUser.uid),
+        createSession(currentUser.uid, sessionMeta()),
         15000,
         ROLLOVER_TIMEOUT,
       );
@@ -1762,6 +2004,7 @@ async function captureAndUpload() {
         screenSummaries,
       },
       block,
+      { t: openSegment?.t || currentTaskId(), deviceId },
     );
 
     const timeStr = now.toLocaleTimeString("en-US", {
@@ -1827,6 +2070,8 @@ async function prefillRememberedEmail() {
 }
 
 function setActiveUI() {
+  renderTicketPicker();
+  void syncSessionTask();
   // Started, resumed or restored: tell the portal straight away.
   sendHeartbeat();
   statusText.textContent = "Session active";
@@ -1842,6 +2087,7 @@ function setActiveUI() {
 }
 
 function setPausedUI() {
+  renderTicketPicker();
   statusText.textContent = "Session paused";
   statusText.className = "status-text";
   startBtn.style.display = "none";
@@ -1856,11 +2102,11 @@ function setPausedUI() {
 
 function setInactiveUI() {
   timerDisplay.textContent = "00h 00m 00s";
+  renderTicketPicker();
   statusText.textContent = "No active session";
   statusText.className = "status-text";
   startBtn.style.display = "";
-  startBtn.disabled = false;
-  startBtn.textContent = "\u25B6 Start Session";
+  resetStartButton();
   stopBtn.style.display = "none";
   endBtn.style.display = "none";
   stopBtn.disabled = true;
@@ -1913,6 +2159,7 @@ function clearSessionState() {
   idleStartedAtMs = null;
   segmentLog = [];
   openSegment = null;
+  sessionTaskId = null;
 }
 
 async function clearStoredSession() {

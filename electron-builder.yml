@@ -18,6 +18,8 @@ files:
   - firebase.js
   - screenshotStorage.js
   - manualOverride.js
+  - tickets.js
+  - ticketPicker.js
   - config.js
   - assets/**
   - package.json

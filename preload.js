@@ -15,6 +15,9 @@ contextBridge.exposeInMainWorld("tracker", {
   getActivityContext: () => ipcRenderer.invoke("get-activity-context"),
   getIdleState: () => ipcRenderer.invoke("get-idle-state"),
   getIdleTime: () => ipcRenderer.invoke("get-idle-time"),
+  // Open Linear tickets from the portal, signed in with the Firebase ID token.
+  getLinearTickets: (idToken) => ipcRenderer.invoke("linear-tickets", idToken),
+  getAppVersion: () => ipcRenderer.invoke("app-version"),
   storeGet: (key) => ipcRenderer.invoke("store-get", key),
   storeSet: (key, value) => ipcRenderer.invoke("store-set", key, value),
   showNotification: (title, body) =>

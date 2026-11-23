@@ -69,6 +69,9 @@ export function onAuthChange(callback) {
 // `block` = the screenshot block it was taken in, in tracked time (ms since the
 // session started, pauses excluded). The portal uses it when the screenshot is
 // deleted, to remove that block's active time (INC-222).
+// `extra.t` = the Linear ticket (issue id) being worked on when it was taken;
+// `extra.deviceId` = this computer. Ticket names live once per session in
+// sessions/{id}.tasks, not on every screenshot.
 export async function saveScreenshot(
   sessionId,
   userId,
@@ -76,6 +79,7 @@ export async function saveScreenshot(
   timestamp,
   activityContext = {},
   block = null,
+  extra = {},
 ) {
   const hasScreenSummaries =
     Array.isArray(activityContext.screenSummaries) &&
@@ -99,17 +103,37 @@ export async function saveScreenshot(
     screenshotDoc.blockEndElapsedMs = block.blockEndElapsedMs;
     screenshotDoc.blockMs = block.blockEndElapsedMs - block.blockStartElapsedMs;
   }
+  if (extra?.t) screenshotDoc.t = extra.t;
+  if (extra?.deviceId) screenshotDoc.deviceId = extra.deviceId;
 
   return addDoc(collection(db, "screenshots"), screenshotDoc);
 }
 
-export async function createSession(userId) {
-  const docRef = await addDoc(collection(db, "sessions"), {
-    userId,
-    startTime: new Date(),
-    status: "active",
-  });
+// `meta.task` = { id, snapshot } of the ticket picked before Start; it goes
+// into tasks (one snapshot per ticket used in the session) and taskId (the
+// current one). `meta.deviceId` / `meta.appVersion` say which computer and
+// tracker version wrote the session.
+export async function createSession(userId, meta = {}) {
+  const data = { userId, startTime: new Date(), status: "active" };
+  if (meta.deviceId) data.deviceId = meta.deviceId;
+  if (meta.appVersion) data.appVersion = meta.appVersion;
+  if (meta.task?.id) {
+    data.taskId = meta.task.id;
+    data.tasks = { [meta.task.id]: meta.task.snapshot };
+  }
+  const docRef = await addDoc(collection(db, "sessions"), data);
   return docRef.id;
+}
+
+// The person switched ticket (or a reload showed a new status): keep the
+// ticket's snapshot, mark it current, and save the blocks, whose new block
+// carries the ticket in `t`. One write.
+export async function saveSessionTask(sessionId, taskId, snapshot, segments) {
+  return updateDoc(doc(db, "sessions", sessionId), {
+    [`tasks.${taskId}`]: snapshot,
+    taskId,
+    ...(Array.isArray(segments) ? { segments } : {}),
+  });
 }
 
 export async function endSession(

@@ -21,11 +21,22 @@ export async function loginUser() {}
 export async function logoutUser() {}
 export function onAuthChange(cb) { fb().authCb = cb; return () => {}; }
 export async function saveScreenshot(...args) { (fb().saved ||= []).push(args); }
-export async function createSession(userId) {
+export async function createSession(userId, meta = {}) {
   const id = "s" + ++fb().n;
   fb().sessions[id] = { userId, status: "active", startTime: new Date() };
+  if (meta.deviceId) fb().sessions[id].deviceId = meta.deviceId;
+  if (meta.appVersion) fb().sessions[id].appVersion = meta.appVersion;
+  if (meta.task?.id) Object.assign(fb().sessions[id], { taskId: meta.task.id, tasks: { [meta.task.id]: meta.task.snapshot } });
   await gate("createSession");
   return id;
+}
+export async function saveSessionTask(id, taskId, snapshot, segments) {
+  (fb().taskWrites ||= []).push({ id, taskId, at: Date.now() });
+  const s = fb().sessions[id];
+  if (!s) return;
+  s.tasks = { ...(s.tasks || {}), [taskId]: snapshot };
+  s.taskId = taskId;
+  if (Array.isArray(segments)) s.segments = segments;
 }
 export async function endSession(id, duration, idleTime, endTime, startTime, segments) {
   await gate("endSession");
@@ -47,6 +58,19 @@ export function watchRemovedTimeForDay(userId, date, onChange) { fb().removedCb 
 `);
 fs.writeFileSync(path.join(dir, "screenshotStorage.js"), "export async function uploadScreenshot() { return {}; }");
 fs.copyFileSync(new URL("../manualOverride.js", import.meta.url), path.join(dir, "manualOverride.js"));
+fs.copyFileSync(new URL("../tickets.js", import.meta.url), path.join(dir, "tickets.js"));
+// Fake ticket menu: the test picks through fb.picker.onPick and sees what
+// the menu would draw in fb.pickerState.
+fs.writeFileSync(path.join(dir, "ticketPicker.js"), `
+export function createTicketPicker(opts) {
+  globalThis.__fb.picker = opts;
+  return {
+    update(state) { globalThis.__fb.pickerState = state; },
+    open() { globalThis.__fb.pickerOpened = (globalThis.__fb.pickerOpened || 0) + 1; },
+    close() {},
+  };
+}
+`);
 
 console.log = () => {};
 // Images "load" straight away.
@@ -55,6 +79,17 @@ console.error = () => {};
 globalThis.requestAnimationFrame = () => {};
 
 const flush = async (n = 10) => { for (let i = 0; i < n; i++) await new Promise((r) => setImmediate(r)); };
+
+// Open Linear tickets as the portal returns them.
+const ticket = (id, identifier, title, status, type, group) => ({
+  id, identifier, title, url: `https://linear.app/x/issue/${identifier}`,
+  status: { name: status, type, color: "#f2c94c" }, project: { id: "p1", name: "Portal" }, group,
+});
+const TICKETS = [
+  ticket("iss-218", "INC-218", "Weekly hours: person week panel", "In Progress", "started", "inProgress"),
+  ticket("iss-215", "INC-215", "Attendance export to CSV", "Todo", "unstarted", "upNext"),
+];
+const pick = async (t) => { fb.picker.onPick(t); await flush(30); };
 let launches = 0;
 let fb;
 
@@ -93,6 +128,11 @@ async function launch(atMs) {
         return [{ dataUrl: "data:image/png;base64,AA", width: 100, height: 50, screenName: "Screen 1" }];
       },
       getActivityContexts: async () => ({ active: { summary: "Test app" }, perScreen: [] }),
+      getAppVersion: async () => "1.0.10",
+      getLinearTickets: async (token) => {
+        (fb.ticketCalls ||= []).push(token);
+        return fb.linear || { ok: true, tickets: TICKETS };
+      },
       showNotification: async () => {},
       logEvent: async () => {},
       onUpdateStatus() {}, onDiagnostic() {}, onAppClosing() {},
@@ -102,8 +142,10 @@ async function launch(atMs) {
   const file = path.join(dir, `renderer-${++launches}.js`);
   fs.writeFileSync(file, rendererSrc);
   await import(pathToFileURL(file).href);
-  fb.authCb({ uid: "u1", email: "u1@test" });
+  fb.authCb({ uid: "u1", email: "u1@test", getIdToken: async () => "id-token-u1" });
   await flush(50);
+  // Most scenarios are about time, not tickets: pick one unless told not to.
+  if (fb.autoPick !== false) await pick(TICKETS[0]);
   return {
     els,
     power: async (name) => { listeners.power(name); await flush(); },
@@ -409,4 +451,205 @@ test("L: after a shutdown, beats stop at the last one and the next start ends th
   assert.equal(s.status, "ended");
   assert.ok(Math.abs(s.endTime - at(24, 10, 1)) < 1 * MIN, `ended at ${new Date(s.endTime).toTimeString()}`);
   await app2.click("end-btn");
+});
+
+// ─── M: Linear ticket ("Working on") ───────────────────────────────────────
+
+test("M: Start needs a ticket; the session records it, this computer and the version", async () => {
+  reset();
+  fb.autoPick = false;
+  fb.lastInputMs = at(22, 9);
+  const app = await launch(at(22, 9));
+  assert.equal(app.els["start-btn"].textContent, "Choose a ticket to start");
+  assert.equal(fb.pickerState.required, true);
+  assert.deepEqual(fb.ticketCalls, ["id-token-u1"], "tickets load once at sign-in, with the login's token");
+  assert.equal(fb.pickerState.tickets.length, 2);
+
+  await app.click("start-btn");
+  assert.equal(sessions().length, 0, "started without a ticket");
+  assert.equal(fb.pickerOpened, 1, "Start should open the ticket menu");
+
+  await pick(TICKETS[0]);
+  assert.equal(app.els["start-btn"].textContent, "▶ Start Session");
+  await app.click("start-btn");
+  await advance(20 * MIN, { working: true });
+
+  const [s] = sessions();
+  assert.equal(s.taskId, "iss-218");
+  assert.deepEqual(s.tasks["iss-218"], {
+    type: "linear", identifier: "INC-218", title: "Weekly hours: person week panel",
+    url: "https://linear.app/x/issue/INC-218", projectId: "p1", project: "Portal",
+    status: "In Progress", statusType: "started", at: at(22, 9),
+  });
+  assert.equal(s.appVersion, "1.0.10");
+  assert.match(s.deviceId, /^[0-9a-f-]{36}$/);
+  assert.ok(s.segments.length > 0 && s.segments.every((b) => b.t === "iss-218"));
+});
+
+test("M: switching ticket mid-session splits the block; idle keeps the ticket; one write per switch", async () => {
+  reset();
+  fb.lastInputMs = at(22, 9);
+  const app = await launch(at(22, 9));
+  await app.click("start-btn");
+  await advance(60 * MIN, { working: true }); // 09:00-10:00 on INC-218
+  await pick(TICKETS[1]); // 10:00 switch to INC-215
+  await advance(30 * MIN, { working: true });
+  await advance(20 * MIN, { working: false }); // idle from 10:30, detected at 10:45
+  await app.click("end-btn");
+
+  const [s] = sessions();
+  assert.deepEqual(Object.keys(s.tasks).sort(), ["iss-215", "iss-218"]);
+  assert.equal(s.taskId, "iss-215");
+  const mins = (b) => Math.round((b.e - b.s) / MIN);
+  const byTicket = (t, k) => s.segments.filter((b) => b.t === t && b.k === k).reduce((n, b) => n + mins(b), 0);
+  assert.equal(byTicket("iss-218", "a"), 60);
+  assert.equal(byTicket("iss-215", "a"), 30);
+  assert.ok(byTicket("iss-215", "i") >= 19, `idle on INC-215: ${byTicket("iss-215", "i")}m`);
+  assert.equal(s.segments.filter((b) => !b.t).length, 0, "every block has a ticket");
+  assert.equal(fb.taskWrites.length, 1, "one write for the switch");
+
+  // Picking the same ticket again changes nothing.
+  reset();
+  fb.lastInputMs = at(22, 9);
+  const app2 = await launch(at(22, 9));
+  await app2.click("start-btn");
+  await advance(10 * MIN, { working: true });
+  await pick(TICKETS[0]);
+  assert.equal((fb.taskWrites || []).length, 0);
+  assert.equal(sessions()[0].segments.length, 1);
+});
+
+test("M: a switch while paused: no new block until Resume, which starts on the new ticket", async () => {
+  reset();
+  fb.lastInputMs = at(22, 9);
+  const app = await launch(at(22, 9));
+  await app.click("start-btn");
+  await advance(30 * MIN, { working: true });
+  await app.click("stop-btn"); // pause
+  await advance(10 * MIN, { working: false });
+  await pick(TICKETS[1]);
+  await advance(5 * MIN, { working: false });
+  await app.click("stop-btn"); // resume
+  await advance(20 * MIN, { working: true });
+  await app.click("end-btn");
+
+  const [s] = sessions();
+  const blocks = s.segments.map((b) => `${b.k}${Math.round((b.e - b.s) / MIN)}:${b.t}`);
+  assert.deepEqual(blocks, ["a30:iss-218", "a20:iss-215"]);
+  assert.equal(s.taskId, "iss-215");
+  assert.ok(s.tasks["iss-215"] && s.tasks["iss-218"]);
+});
+
+test("M: each screenshot saves the ticket it was taken on and the computer", async () => {
+  reset();
+  fb.captureOk = true;
+  fb.lastInputMs = at(22, 9);
+  const app = await launch(at(22, 9));
+  await app.click("start-btn");
+  await advance(20 * MIN, { working: true });
+  await pick(TICKETS[1]);
+  await advance(20 * MIN, { working: true });
+  await app.click("end-btn");
+
+  const extras = (fb.saved || []).map((args) => args[6]);
+  assert.ok(extras.length >= 4, `expected 4 screenshots, got ${extras.length}`);
+  assert.deepEqual(extras.slice(0, 2).map((x) => x.t), ["iss-218", "iss-218"]);
+  assert.deepEqual(extras.slice(-2).map((x) => x.t), ["iss-215", "iss-215"]);
+  extras.forEach((x) => assert.equal(x.deviceId, sessions()[0].deviceId));
+});
+
+test("M: the session started at midnight carries the ticket on", async () => {
+  reset();
+  fb.lastInputMs = at(15, 23);
+  const app = await launch(at(15, 23));
+  await app.click("start-btn");
+  await advance(70 * MIN, { working: true }); // 23:00 -> 00:10
+
+  const [old, fresh] = sessions();
+  assert.equal(old.status, "ended");
+  assert.ok(old.segments.every((b) => b.t === "iss-218"));
+  assert.equal(fresh.taskId, "iss-218");
+  assert.ok(fresh.tasks["iss-218"]);
+  assert.ok(fresh.segments.every((b) => b.t === "iss-218"));
+  // The pick now belongs to the new day: End, then Start again, needs no new pick.
+  await app.click("end-btn");
+  await app.click("start-btn");
+  assert.equal(sessions().length, 3);
+});
+
+test("M: the pick survives a restart the same day, not the next morning", async () => {
+  reset();
+  fb.autoPick = false;
+  fb.lastInputMs = at(22, 9);
+  const app = await launch(at(22, 9));
+  await pick(TICKETS[1]);
+  await app.click("start-btn");
+  await advance(10 * MIN, { working: true });
+  await app.click("end-btn");
+
+  const app2 = await launch(at(22, 15)); // reopened the same afternoon
+  assert.equal(fb.pickerState.selected?.id, "iss-215");
+  assert.equal(app2.els["start-btn"].textContent, "▶ Start Session");
+
+  const app3 = await launch(at(23, 9)); // next morning
+  assert.equal(fb.pickerState.selected, null);
+  assert.equal(app3.els["start-btn"].textContent, "Choose a ticket to start");
+});
+
+test("M: a running session restored after a restart keeps its ticket and blocks", async () => {
+  reset();
+  fb.lastInputMs = at(22, 9);
+  const app = await launch(at(22, 9));
+  await app.click("start-btn");
+  await advance(30 * MIN, { working: true });
+  fb.autoPick = false;
+  await launch(Date.now()); // app restarted while the session runs
+  await advance(10 * MIN, { working: true });
+  const s = sessions().find((x) => x.status !== "ended");
+  assert.equal(fb.pickerState.selected?.id, "iss-218");
+  assert.ok(s.segments.every((b) => b.t === "iss-218"));
+});
+
+test("M: a reload with a new status updates the running session's snapshot", async () => {
+  reset();
+  fb.lastInputMs = at(22, 9);
+  const app = await launch(at(22, 9));
+  await app.click("start-btn");
+  await advance(10 * MIN, { working: true });
+  fb.linear = { ok: true, tickets: [{ ...TICKETS[0], status: { name: "In Review", type: "started", color: "#4cb782" } }, TICKETS[1]] };
+  fb.picker.onReload();
+  await flush(30);
+  const [s] = sessions();
+  assert.equal(s.tasks["iss-218"].status, "In Review");
+  assert.equal(s.segments.length, 1, "a status change doesn't split the block");
+  assert.equal(fb.pickerState.selected.status.name, "In Review");
+});
+
+test("M: Linear down keeps the saved list and says why; not in Linear is its own message", async () => {
+  reset();
+  fb.lastInputMs = at(22, 9);
+  await launch(at(22, 9)); // loads and saves the list
+  fb.linear = { ok: false, code: "linear_unavailable", message: "Couldn't load tickets from Linear" };
+  fb.picker.onReload();
+  await flush(30);
+  assert.equal(fb.pickerState.tickets.length, 2, "the saved list stays");
+  assert.equal(fb.pickerState.error.code, "linear_unavailable");
+  assert.equal(fb.pickerState.loading, false);
+
+  fb.linear = { ok: false, code: "not_in_linear", message: "No Linear account uses u1@test" };
+  fb.picker.onReload();
+  await flush(30);
+  assert.equal(fb.pickerState.error.code, "not_in_linear");
+});
+
+test("M: logout forgets the pick and the saved list", async () => {
+  reset();
+  fb.lastInputMs = at(22, 9);
+  const app = await launch(at(22, 9));
+  assert.ok(fb.store.get("selectedTicket"));
+  assert.ok(fb.store.get("linearTickets"));
+  await app.click("logout-btn");
+  assert.equal(fb.store.get("selectedTicket"), undefined);
+  assert.equal(fb.store.get("linearTickets"), undefined);
+  assert.ok(fb.store.get("deviceId"), "the computer's id stays");
 });
