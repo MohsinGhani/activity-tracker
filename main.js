@@ -980,6 +980,42 @@ ipcMain.handle("get-activity-context", async () => {
   }
 });
 
+// The portal the tracker talks to (prod unless TRACKER_PORTAL_URL is set).
+const PORTAL_URL = (
+  process.env.TRACKER_PORTAL_URL || "https://portal.incitertech.com"
+).replace(/\/+$/, "");
+
+// The signed-in person's open Linear tickets. The portal asks Linear with its
+// own key; the tracker only sends the Firebase ID token. Fetched here, not in
+// the renderer, because the file:// page can't make cross-origin calls.
+// Answers { ok: true, tickets, fetchedAt } or { ok: false, code, message }.
+ipcMain.handle("linear-tickets", async (_e, idToken) => {
+  if (typeof idToken !== "string" || !idToken) {
+    return { ok: false, code: "signed_out", message: "Not signed in" };
+  }
+  try {
+    const res = await fetch(`${PORTAL_URL}/api/linear/my-tickets`, {
+      headers: { authorization: `Bearer ${idToken}`, accept: "application/json" },
+      signal: AbortSignal.timeout(15000),
+    });
+    const body = await res.json().catch(() => null);
+    if (res.ok && Array.isArray(body?.tickets)) {
+      return { ok: true, tickets: body.tickets, fetchedAt: body.fetchedAt };
+    }
+    return {
+      ok: false,
+      status: res.status,
+      code: body?.data?.code || (res.status === 401 ? "signed_out" : "error"),
+      message: body?.message || `HTTP ${res.status}`,
+    };
+  } catch (error) {
+    await logError("linear-tickets", error);
+    return { ok: false, code: "offline", message: error?.message || "Network error" };
+  }
+});
+
+ipcMain.handle("app-version", () => app.getVersion());
+
 ipcMain.handle("store-get", (_e, key) => store.get(key) ?? null);
 
 ipcMain.handle("store-set", (_e, key, value) => {
