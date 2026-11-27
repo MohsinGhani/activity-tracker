@@ -47,8 +47,8 @@ export async function getTodaySessionsSummary() { return { totalEndedSeconds: 0,
 export const TRACKER_SETTINGS_DEFAULTS = Object.freeze({ manualTimeAllowed: false, screenshotIntervalMin: 10, idleThresholdMin: 15 });
 export function watchTrackerSettings(userId, onChange) { onChange({ ...TRACKER_SETTINGS_DEFAULTS, ...(fb().settings || {}) }); return () => {}; }
 export async function getManualTimeForDay() { return []; }
-export async function addManualTime() { return "m1"; }
-export async function deleteManualTime() {}
+export async function addManualTime() { if (fb().failManual) throw new Error("offline"); return "m" + ++fb().n; }
+export async function deleteManualTime() { if (fb().failManual) throw new Error("offline"); }
 export async function saveSessionSegments(id, segments) { if (fb().sessions[id]) fb().sessions[id].segments = segments; }
 export async function saveSessionHeartbeat(id, segments) {
   (fb().beats ||= []).push({ id, at: Date.now() });
@@ -98,7 +98,8 @@ function fakeElement() {
     handlers: {}, style: {}, textContent: "", innerHTML: "", value: "", disabled: false, hidden: false,
     classList: { add() {}, remove() {}, toggle() {}, contains: () => false },
     addEventListener(type, fn) { this.handlers[type] = fn; },
-    appendChild() {}, remove() {},
+    appendChild() {}, remove() {}, append() {}, replaceChildren() {}, setAttribute() {},
+    reset() {}, focus() {},
     // Enough of a canvas for a screenshot to be "encoded".
     getContext: () => ({ drawImage() {} }),
     toBlob: (cb) => cb({ size: 1 }),
@@ -112,11 +113,12 @@ async function launch(atMs) {
   const els = {};
   globalThis.document = {
     getElementById: (id) => (els[id] ??= fakeElement()),
-    createElement: () => fakeElement(),
+    createElement: () => { const e = fakeElement(); (fb.created ||= []).push(e); return e; },
   };
   const listeners = {};
   globalThis.window = {
     addEventListener() {},
+    confirm: () => true,
     tracker: {
       platform: "win32",
       storeGet: async (k) => fb.store.get(k) ?? null,
@@ -132,6 +134,10 @@ async function launch(atMs) {
       getLinearTickets: async (token) => {
         (fb.ticketCalls ||= []).push(token);
         return fb.linear || { ok: true, tickets: TICKETS };
+      },
+      sendTrackerEvent: async (token, event) => {
+        (fb.events ||= []).push({ token, ...event, at: Date.now() });
+        return fb.eventReply ? fb.eventReply(event) : { ok: true, sent: true };
       },
       showNotification: async () => {},
       logEvent: async () => {},
@@ -652,4 +658,110 @@ test("M: logout forgets the pick and the saved list", async () => {
   assert.equal(fb.store.get("selectedTicket"), undefined);
   assert.equal(fb.store.get("linearTickets"), undefined);
   assert.ok(fb.store.get("deviceId"), "the computer's id stays");
+});
+
+// ─── N: events to the portal (Discord alerts) ──────────────────────────────
+const pkDay = (ms) => new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Karachi", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date(ms));
+const events = () => (fb.events || []).map(({ at: _at, token: _t, ...e }) => e);
+
+test("N: only the first Start of the day says 'started work'; End then Start again doesn't; the next day does", async () => {
+  reset();
+  fb.lastInputMs = at(22, 9);
+  let app = await launch(at(22, 9));
+  await app.click("start-btn");
+  assert.deepEqual(events(), [{ type: "timer.started", firstOfDay: true }]);
+  assert.equal(fb.events[0].token, "id-token-u1", "sent with the person's login");
+  assert.deepEqual(fb.store.get("workStartedDay"), { uid: "u1", day: pkDay(at(22, 9)) });
+
+  await advance(10 * MIN, { working: true });
+  await app.click("end-btn");
+  await app.click("start-btn");
+  assert.deepEqual(events().map((e) => e.firstOfDay), [true, false]);
+
+  await app.click("end-btn");
+  app = await launch(at(22, 15)); // reopened the same afternoon
+  await app.click("start-btn");
+  assert.deepEqual(events().map((e) => e.firstOfDay), [true, false, false]);
+
+  await app.click("end-btn");
+  app = await launch(at(23, 9)); // next morning
+  await app.click("start-btn");
+  assert.deepEqual(events().map((e) => e.firstOfDay), [true, false, false, true]);
+});
+
+test("N: pause, resume, idle, the midnight restart and a restart while running send nothing", async () => {
+  reset();
+  fb.lastInputMs = at(15, 20);
+  const app = await launch(at(15, 20));
+  await app.click("start-btn");
+  await advance(10 * MIN, { working: true });
+  await app.click("stop-btn"); // pause
+  await advance(5 * MIN, { working: false });
+  await app.click("stop-btn"); // resume
+  await advance(30 * MIN, { working: false }); // goes idle
+  await advance(4 * H, { working: true }); // past midnight: the session restarts at 00:00
+  assert.equal(sessions().length, 2, "a new session at midnight");
+  await launch(Date.now()); // the app restarts with the session running
+  await flush(50);
+  assert.deepEqual(events(), [{ type: "timer.started", firstOfDay: true }]);
+});
+
+test("N: a failed send is tried once more after 30 s and never stops the work; the next Start tries again", async () => {
+  reset();
+  fb.eventReply = () => ({ ok: false, code: "offline" });
+  fb.lastInputMs = at(22, 9);
+  const app = await launch(at(22, 9));
+  await app.click("start-btn");
+  assert.equal(sessions()[0].status, "active", "tracking started anyway");
+  assert.equal(fb.events.length, 1);
+  await advance(31e3, { working: true });
+  assert.equal(fb.events.length, 2, "one retry");
+  await advance(5 * MIN, { working: true });
+  assert.equal(fb.events.length, 2, "no more retries");
+  assert.equal(fb.store.get("workStartedDay"), undefined, "the day isn't marked as told");
+
+  fb.eventReply = null; // the portal is back
+  await app.click("end-btn");
+  await app.click("start-btn");
+  assert.deepEqual(events().at(-1), { type: "timer.started", firstOfDay: true });
+  assert.ok(fb.store.get("workStartedDay"));
+
+  // A refused event (400) isn't retried.
+  fb.eventReply = () => ({ ok: false, status: 400, code: "error" });
+  await app.click("end-btn");
+  await app.click("start-btn");
+  const count = fb.events.length;
+  await advance(31e3, { working: true });
+  assert.equal(fb.events.length, count);
+});
+
+test("N: manual time added and deleted send its minutes and note, only after the save worked", async () => {
+  reset();
+  fb.settings = { manualTimeAllowed: true };
+  fb.lastInputMs = at(22, 15);
+  const app = await launch(at(22, 15));
+  const form = app.els["manual-form"];
+  const fill = (from, to, note) => {
+    app.els["manual-from"].value = from;
+    app.els["manual-to"].value = to;
+    app.els["manual-note"].value = note;
+  };
+  const submit = async () => { await form.handlers.submit({ preventDefault() {} }); await flush(30); };
+
+  fill("13:00", "14:15", "  meeting with Zoya ");
+  await submit();
+  const day = pkDay(at(22, 13));
+  assert.deepEqual(events(), [{ type: "manual_time.created", minutes: 75, note: "meeting with Zoya", date: day }]);
+
+  // Saving failed: nothing is sent.
+  fb.failManual = true;
+  fill("10:00", "10:30", "standup");
+  await submit();
+  assert.equal(fb.events.length, 1);
+  fb.failManual = false;
+
+  const del = fb.created.filter((e) => e.className === "manual-item-delete").at(-1);
+  del.handlers.click();
+  await flush(30);
+  assert.deepEqual(events().at(-1), { type: "manual_time.deleted", minutes: 75, note: "meeting with Zoya", date: day });
 });

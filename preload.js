@@ -18,6 +18,7 @@ contextBridge.exposeInMainWorld("tracker", {
   // Open Linear tickets from the portal, signed in with the Firebase ID token.
   getLinearTickets: (idToken) => ipcRenderer.invoke("linear-tickets", idToken),
   getAppVersion: () => ipcRenderer.invoke("app-version"),
+  sendTrackerEvent: (idToken, event) => ipcRenderer.invoke("tracker-event", idToken, event),
   storeGet: (key) => ipcRenderer.invoke("store-get", key),
   storeSet: (key, value) => ipcRenderer.invoke("store-set", key, value),
   showNotification: (title, body) =>

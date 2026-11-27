@@ -1014,6 +1014,32 @@ ipcMain.handle("linear-tickets", async (_e, idToken) => {
   }
 });
 
+// Sends one event (timer.started, manual_time.created, manual_time.deleted)
+// to the portal, which posts it to the person's Discord channel. Called after
+// the change is saved to Firebase; a failure never affects tracking.
+ipcMain.handle("tracker-event", async (_e, idToken, event) => {
+  if (typeof idToken !== "string" || !idToken) return { ok: false, code: "signed_out" };
+  if (!event || typeof event.type !== "string") return { ok: false, code: "bad_event" };
+  try {
+    const res = await fetch(`${PORTAL_URL}/api/tracker/events`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${idToken}`,
+        "content-type": "application/json",
+        accept: "application/json",
+      },
+      body: JSON.stringify(event),
+      signal: AbortSignal.timeout(10000),
+    });
+    const body = await res.json().catch(() => null);
+    if (res.ok) return { ok: true, sent: body?.sent === true, reason: body?.reason };
+    return { ok: false, status: res.status, code: "error", message: body?.message || `HTTP ${res.status}` };
+  } catch (error) {
+    await logError("tracker-event", error);
+    return { ok: false, code: "offline", message: error?.message || "Network error" };
+  }
+});
+
 ipcMain.handle("app-version", () => app.getVersion());
 
 ipcMain.handle("store-get", (_e, key) => store.get(key) ?? null);

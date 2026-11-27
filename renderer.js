@@ -476,6 +476,66 @@ function forgetTickets() {
   renderTicketPicker();
 }
 
+// ─── Tracker events ─────────────────────────────────────────────────────────
+// After a change is saved to Firebase, the tracker tells the portal
+// (timer.started, manual_time.created, manual_time.deleted), which posts it to
+// the person's Discord channel. Sent in the background with one retry; a
+// failure is only logged and never affects tracking.
+const EVENT_RETRY_MS = 30 * 1000;
+
+async function sendEventOnce(user, event) {
+  try {
+    const token =
+      typeof user.getIdToken === "function" ? await user.getIdToken() : "";
+    return await window.tracker.sendTrackerEvent(token, event);
+  } catch (err) {
+    return { ok: false, code: "offline", message: err?.message || "" };
+  }
+}
+
+function sendTrackerEvent(event, onSent) {
+  const user = currentUser;
+  if (!user || typeof window.tracker.sendTrackerEvent !== "function") return;
+  void (async () => {
+    let res = await sendEventOnce(user, event);
+    if (!res?.ok && res?.status !== 400) {
+      await new Promise((r) => setTimeout(r, EVENT_RETRY_MS));
+      if (currentUser?.uid !== user.uid) return; // signed out meanwhile
+      res = await sendEventOnce(user, event);
+    }
+    if (res?.ok) onSent?.(res);
+    else {
+      void window.tracker.logEvent?.(
+        "tracker-event",
+        `${event.type} not sent: ${res?.status || ""} ${res?.code || ""} ${res?.message || ""}`,
+      );
+    }
+  })();
+}
+
+// Start button: "has started work" is posted for the first start of the
+// Pakistan-time day only. The day is remembered once the portal has it, so a
+// failed send is tried again on the next Start that day.
+async function sendTimerStarted() {
+  const uid = currentUser?.uid;
+  if (!uid) return;
+  const day = getPkDateString();
+  const last = await window.tracker.storeGet("workStartedDay").catch(() => null);
+  const firstOfDay = !(last && last.uid === uid && last.day === day);
+  sendTrackerEvent({ type: "timer.started", firstOfDay }, () => {
+    if (firstOfDay && currentUser?.uid === uid) {
+      void window.tracker.storeSet("workStartedDay", { uid, day });
+    }
+  });
+}
+
+const manualTimeEvent = (type, entry) => ({
+  type,
+  minutes: Math.max(1, Math.round(entry.minutes)),
+  note: entry.note || "",
+  date: getPkDateString(entry.start),
+});
+
 window.addEventListener("unhandledrejection", (event) => {
   const msg = event?.reason?.message || String(event?.reason || "unknown");
   console.error("Unhandled rejection:", event?.reason);
@@ -911,6 +971,7 @@ startBtn.addEventListener("click", async () => {
     startIdlePoll();
     renderTodayTotalTime();
     setActiveUI();
+    void sendTimerStarted();
   } catch (err) {
     console.error("Failed to start session:", err);
     const friendly = err?.message || "check the console.";
@@ -2436,10 +2497,9 @@ async function submitManualEntry(event) {
   try {
     const date = getPkDateString(start);
     const id = await addManualTime(currentUser.uid, { date, start, end, note });
-    manualEntries = [
-      ...manualEntries,
-      { id, start, end, minutes: Math.round((end - start) / 60000), note },
-    ].sort((a, b) => a.start - b.start);
+    const added = { id, start, end, minutes: Math.round((end - start) / 60000), note };
+    manualEntries = [...manualEntries, added].sort((a, b) => a.start - b.start);
+    sendTrackerEvent(manualTimeEvent("manual_time.created", added));
     closeManualDialog();
     renderManualTime();
     renderTodayTotalTime();
@@ -2459,6 +2519,7 @@ async function removeManualEntry(entry) {
   try {
     await deleteManualTime(entry.id);
     manualEntries = manualEntries.filter((x) => x.id !== entry.id);
+    sendTrackerEvent(manualTimeEvent("manual_time.deleted", entry));
     renderManualTime();
     renderTodayTotalTime();
     showToast("Manual time deleted.");
