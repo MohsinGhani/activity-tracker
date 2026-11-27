@@ -68,6 +68,7 @@ export function createTicketPicker(opts) {
     update(state) { globalThis.__fb.pickerState = state; },
     open() { globalThis.__fb.pickerOpened = (globalThis.__fb.pickerOpened || 0) + 1; },
     close() {},
+    focusNote() { globalThis.__fb.noteFocused = (globalThis.__fb.noteFocused || 0) + 1; },
   };
 }
 `);
@@ -90,6 +91,20 @@ const TICKETS = [
   ticket("iss-215", "INC-215", "Attendance export to CSV", "Todo", "unstarted", "upNext"),
 ];
 const pick = async (t) => { fb.picker.onPick(t); await flush(30); };
+// The note box: switch to it, type, "Add note" (or "Save"), "Edit", "Cancel".
+const noteMode = async (on = true) => { fb.picker.onNoteMode(on); await flush(30); };
+const typeNote = async (text) => { fb.picker.onNoteInput(text); await flush(5); };
+const addNote = async (text) => { fb.picker.onNoteInput(text); fb.picker.onNoteSubmit(text); await flush(30); };
+const editNote = async () => { fb.picker.onNoteEdit(); await flush(5); };
+const cancelNote = async () => { fb.picker.onNoteCancel(); await flush(5); };
+const newNote = async () => { fb.picker.onNoteNew(); await flush(5); };
+// A row of "Today's notes" in the menu.
+const pickNote = async (title) => {
+  const row = (fb.pickerState.notes || []).find((n) => n.title === title);
+  assert.ok(row, `"${title}" is in today's notes`);
+  fb.picker.onPick(row);
+  await flush(30);
+};
 let launches = 0;
 let fb;
 
@@ -764,4 +779,177 @@ test("N: manual time added and deleted send its minutes and note, only after the
   del.handlers.click();
   await flush(30);
   assert.deepEqual(events().at(-1), { type: "manual_time.deleted", minutes: 75, note: "meeting with Zoya", date: day });
+});
+
+// ─── O: a note instead of a ticket ─────────────────────────────────────────
+
+test("O: a note is only used once added; Start then works and the session keeps it like a ticket", async () => {
+  reset();
+  fb.autoPick = false;
+  fb.lastInputMs = at(24, 9);
+  const app = await launch(at(24, 9));
+  await noteMode(true);
+  assert.equal(fb.pickerState.noteMode, true);
+  assert.equal(fb.noteFocused, 1, "the note box gets the focus");
+  assert.equal(app.els["start-btn"].textContent, "Add a note to start");
+
+  // Typed but not added: Start doesn't create it, it goes back to the box.
+  await typeNote("Client call prep");
+  assert.equal(app.els["start-btn"].textContent, "Add a note to start");
+  await app.click("start-btn");
+  assert.equal(sessions().length, 0, "nothing started from a typed-only note");
+  assert.equal(fb.noteFocused, 2);
+
+  // Blank can't be added.
+  await addNote("   ");
+  assert.equal(fb.pickerState.selected, null);
+
+  await addNote("  Client   call prep ");
+  assert.equal(fb.pickerState.selected?.type, "note");
+  assert.equal(fb.pickerState.noteText, "", "the box is cleared once added");
+  assert.equal(app.els["start-btn"].textContent, "▶ Start Session");
+  await app.click("start-btn");
+  await advance(20 * MIN, { working: true });
+
+  const [s] = sessions();
+  assert.match(s.taskId, /^note-[0-9a-f]+$/);
+  assert.deepEqual(s.tasks[s.taskId], { type: "note", title: "Client call prep", at: at(24, 9) });
+  assert.ok(s.segments.length > 0 && s.segments.every((b) => b.t === s.taskId));
+  assert.deepEqual(events(), [{ type: "timer.started", firstOfDay: true }], "Discord 'started work' as usual");
+});
+
+test("O: while running, typing changes nothing; Edit + Cancel keeps the note; Edit + Save switches", async () => {
+  reset();
+  fb.autoPick = false;
+  fb.lastInputMs = at(24, 9);
+  const app = await launch(at(24, 9));
+  await noteMode(true);
+  await addNote("Sprint planning");
+  await app.click("start-btn");
+  await advance(10 * MIN, { working: true });
+
+  await editNote();
+  assert.equal(fb.pickerState.noteEditing, true);
+  assert.equal(fb.pickerState.noteText, "Sprint planning", "Edit starts from the current note");
+  await typeNote("Sprint planning and a typo");
+  await cancelNote();
+  assert.equal(fb.pickerState.noteEditing, false);
+  assert.equal((fb.taskWrites || []).length, 0, "Cancel writes nothing");
+  assert.equal(fb.pickerState.selected.title, "Sprint planning");
+
+  await editNote();
+  await addNote("   "); // Save with a blank note: refused, still editing
+  assert.equal((fb.taskWrites || []).length, 0);
+  await addNote("x".repeat(121)); // too long: refused
+  assert.equal((fb.taskWrites || []).length, 0);
+
+  await addNote("Sprint review"); // Save
+  await advance(10 * MIN, { working: true });
+  await app.click("end-btn");
+  const [s] = sessions();
+  assert.equal(fb.taskWrites.length, 1, "one write for the switch");
+  assert.deepEqual(Object.values(s.tasks).map((t) => t.title).sort(), ["Sprint planning", "Sprint review"]);
+});
+
+test("O: two notes, then a ticket, then back to the first note from Today's notes: its time keeps adding up", async () => {
+  reset();
+  fb.autoPick = false;
+  fb.lastInputMs = at(24, 9);
+  const app = await launch(at(24, 9));
+  await noteMode(true);
+  await addNote("Interview prep");
+  await app.click("start-btn");
+  await advance(30 * MIN, { working: true }); // 09:00-09:30 note A
+  await newNote();
+  assert.equal(fb.pickerState.noteAdding, true, "New note opens an empty box");
+  assert.equal(fb.pickerState.noteText, "");
+  assert.equal(fb.pickerState.selected.title, "Interview prep", "the current note stays until the new one is added");
+  await addNote("Client call"); // 09:30-09:50 note B
+  await advance(20 * MIN, { working: true });
+  await pick(TICKETS[0]); // 09:50-10:10 ticket
+  assert.equal(fb.pickerState.noteMode, false);
+  await advance(20 * MIN, { working: true });
+
+  assert.deepEqual(fb.pickerState.notes.map((n) => n.title), ["Client call", "Interview prep"], "today's notes, newest first");
+  await pickNote("Interview prep"); // 10:10-10:25 back on note A
+  await advance(15 * MIN, { working: true });
+  await app.click("end-btn");
+
+  const [s] = sessions();
+  const id = (title) => Object.keys(s.tasks).find((k) => s.tasks[k].title === title);
+  const mins = (b) => Math.round((b.e - b.s) / MIN);
+  const on = (t) => s.segments.filter((b) => b.t === t && b.k === "a").reduce((n, b) => n + mins(b), 0);
+  assert.equal(Object.keys(s.tasks).length, 3, "note A, note B and the ticket");
+  assert.equal(on(id("Interview prep")), 45, "30 + 15 minutes on note A, one task");
+  assert.equal(on(id("Client call")), 20);
+  assert.equal(on("iss-218"), 20);
+  assert.equal(fb.taskWrites.length, 3, "one write per switch");
+});
+
+test("O: today's notes and the added note survive a restart the same day, not the next morning", async () => {
+  reset();
+  fb.autoPick = false;
+  fb.lastInputMs = at(24, 9);
+  const app = await launch(at(24, 9));
+  await noteMode(true);
+  await addNote("Team training");
+  await app.click("start-btn");
+  await advance(10 * MIN, { working: true });
+  await app.click("end-btn");
+
+  const app2 = await launch(at(24, 15));
+  assert.equal(fb.pickerState.noteMode, true);
+  assert.equal(fb.pickerState.selected?.title, "Team training");
+  assert.deepEqual(fb.pickerState.notes.map((n) => n.title), ["Team training"]);
+  assert.equal(app2.els["start-btn"].textContent, "▶ Start Session");
+
+  const app3 = await launch(at(25, 9));
+  assert.equal(fb.pickerState.noteMode, false);
+  assert.equal(fb.pickerState.selected, null);
+  assert.deepEqual(fb.pickerState.notes, [], "a new day starts with no notes");
+  assert.equal(app3.els["start-btn"].textContent, "Choose a ticket to start");
+});
+
+test("O: 'Pick a ticket instead' keeps the running note until a ticket is picked; logout forgets today's notes", async () => {
+  reset();
+  fb.autoPick = false;
+  fb.lastInputMs = at(24, 9);
+  const app = await launch(at(24, 9));
+  await noteMode(true);
+  await addNote("Client call");
+  await app.click("start-btn");
+  await advance(10 * MIN, { working: true });
+  await noteMode(false);
+  assert.equal(fb.pickerState.noteMode, false);
+  assert.equal(fb.pickerState.selected.type, "note", "still on the note");
+  assert.equal((fb.taskWrites || []).length, 0);
+  await pick(TICKETS[1]);
+  assert.equal(sessions()[0].taskId, "iss-215");
+  assert.ok(fb.store.get("todayNotes"));
+  await app.click("end-btn");
+  await app.click("logout-btn");
+  assert.equal(fb.store.get("todayNotes"), undefined);
+});
+
+test("O: New note + Cancel keeps the current note; a new note doesn't remove the first from today's notes", async () => {
+  reset();
+  fb.autoPick = false;
+  fb.lastInputMs = at(24, 9);
+  const app = await launch(at(24, 9));
+  await noteMode(true);
+  await addNote("Design review");
+  await app.click("start-btn");
+  await advance(10 * MIN, { working: true });
+  await newNote();
+  await typeNote("Something else");
+  await cancelNote();
+  assert.equal(fb.pickerState.noteAdding, false);
+  assert.equal(fb.pickerState.selected.title, "Design review");
+  assert.equal((fb.taskWrites || []).length, 0, "Cancel writes nothing");
+
+  await newNote();
+  await addNote("Code review");
+  assert.equal(sessions()[0].taskId, fb.pickerState.selected.id);
+  assert.deepEqual(fb.pickerState.notes.map((n) => n.title), ["Code review", "Design review"]);
+  assert.equal(fb.taskWrites.length, 1);
 });

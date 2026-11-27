@@ -1151,8 +1151,174 @@ body {
 }
 
 .ticket-menu-foot {
-  padding: 8px 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 8px 8px 12px;
   border-top: 1px solid rgba(255, 255, 255, 0.08);
   font-size: 11px;
   color: var(--text-secondary);
+}
+
+/* ─── A note instead of a ticket ─────────────────────────────────────────── */
+.ticket-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.ticket-note-toggle {
+  height: 22px;
+  padding: 0 6px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: #34d399;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.ticket-note-toggle:hover,
+.ticket-note-toggle:focus-visible {
+  background: rgba(52, 211, 153, 0.1);
+}
+
+.ticket-note {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.ticket-note-form,
+.ticket-note-current {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.ticket-note-current {
+  height: 48px;
+  padding: 0 6px 0 12px;
+  border-radius: var(--radius);
+  border: 1px solid rgba(52, 211, 153, 0.5);
+  background: var(--bg-card);
+}
+
+.ticket-note-edit,
+.ticket-note-cancel,
+.ticket-note-submit {
+  flex-shrink: 0;
+  height: 36px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 12px;
+  border-radius: 8px;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.ticket-note-edit,
+.ticket-note-cancel {
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: transparent;
+  color: var(--text-primary);
+}
+
+.ticket-note-edit svg {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.ticket-note-edit:hover,
+.ticket-note-cancel:hover {
+  border-color: rgba(52, 211, 153, 0.5);
+}
+
+.ticket-note-submit {
+  border: 0;
+  background: var(--accent);
+  color: #fff;
+}
+
+.ticket-note-submit:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+
+.ticket-note-submit:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* "Today's notes" rows in the ticket menu */
+.ticket-note-tag {
+  color: #34d399;
+  font-weight: 600;
+}
+
+.ticket-note-input {
+  flex: 1;
+  min-width: 0;
+  height: 48px;
+  padding: 0 12px;
+  border-radius: var(--radius);
+  border: 1px solid rgba(52, 211, 153, 0.5);
+  background: var(--bg-card);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 13px;
+  outline: none;
+}
+
+.ticket-note-input:focus {
+  border-color: #34d399;
+  box-shadow: 0 0 0 3px rgba(52, 211, 153, 0.15);
+}
+
+.ticket-note-help {
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text-secondary);
+}
+
+.ticket-note-from-menu {
+  flex-shrink: 0;
+  height: 30px;
+  padding: 0 10px;
+  border-radius: 7px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: transparent;
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.ticket-note-from-menu:hover,
+.ticket-note-from-menu:focus-visible {
+  border-color: rgba(52, 211, 153, 0.5);
+}
+
+/* The field when a note is the task (switched back to tickets). */
+.ticket-field-meta.is-note {
+  color: #34d399;
+  font-family: inherit;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
 }

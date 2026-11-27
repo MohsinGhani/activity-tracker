@@ -4,6 +4,7 @@
 
 // Order and names of the menu's groups. The portal sends each ticket's group.
 export const GROUPS = [
+  ["notes", "Today's notes"], // notes added today (no ticket), newest first
   ["inProgress", "In progress"],
   ["upNext", "Up next"],
   ["dailyLogs", "Daily logs"],
@@ -54,9 +55,67 @@ export function pickTicketFields(ticket) {
   };
 }
 
+// ─── A note instead of a ticket ─────────────────────────────────────────────
+// No ticket for the work: the person writes a short note and starts on it.
+// A note is kept like a ticket (sessions.tasks / taskId / blocks' `t`) with
+// type "note". Its id comes from the text, so the same note the same day adds
+// up in one row in the portal.
+export const NOTE_MAX = 120;
+
+// The note as it is kept: single spaces, trimmed, 1–120 characters; "" if not.
+export function cleanNote(text) {
+  const note = String(text ?? "").replace(/\s+/g, " ").trim();
+  return note.length > 0 && note.length <= NOTE_MAX ? note : "";
+}
+
+// cyrb53: a short, stable hash of the lower-cased note (not for security).
+function noteHash(text) {
+  let h1 = 0xdeadbeef;
+  let h2 = 0x41c6ce57;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text.charCodeAt(i);
+    h1 = Math.imul(h1 ^ ch, 2654435761);
+    h2 = Math.imul(h2 ^ ch, 1597334677);
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(16);
+}
+
+// The selection for a note, or null for a blank or too-long one.
+export function noteTask(text, uid, atMs) {
+  const title = cleanNote(text);
+  if (!title) return null;
+  return {
+    uid,
+    id: `note-${noteHash(title.toLowerCase())}`,
+    type: "note",
+    identifier: "",
+    title,
+    url: "",
+    status: { name: "", type: "", color: "" },
+    project: null,
+    group: "notes",
+    pickedDay: dayKey(atMs),
+  };
+}
+
+// Today's notes on this computer, newest first, for the ticket menu, so the
+// person can go back to an earlier note. { uid, day, notes: [{ id, title }] };
+// a new day starts empty.
+export function rememberNote(list, note, uid, day) {
+  const same = list?.uid === uid && list?.day === day;
+  const notes = (same ? list.notes : []).filter((n) => n.id !== note.id);
+  return { uid, day, notes: [{ id: note.id, title: note.title }, ...notes].slice(0, 50) };
+}
+
+export const isNote = (task) => task?.type === "note";
+
 // What the session keeps about a ticket: sessions/{id}.tasks[<linear id>].
 // Taken when it is picked, so the portal shows the status it had that day.
+// A note keeps only its text.
 export function taskSnapshot(ticket, atMs) {
+  if (isNote(ticket)) return { type: "note", title: ticket.title, at: atMs };
   return {
     type: "linear",
     identifier: ticket.identifier,
@@ -72,6 +131,7 @@ export function taskSnapshot(ticket, atMs) {
 
 // True when a reload shows something the session's snapshot should follow.
 export function ticketChanged(before, after) {
+  if (isNote(before)) return false; // a note isn't in Linear
   return (
     !!before &&
     !!after &&
