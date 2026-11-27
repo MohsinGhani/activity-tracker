@@ -22,7 +22,10 @@ import { applyManualOverride, mergeWindows } from "./manualOverride.js";
 import { createTicketPicker } from "./ticketPicker.js";
 import {
   dayKey,
+  isNote,
+  noteTask,
   pickTicketFields,
+  rememberNote,
   STALE_MS,
   taskSnapshot,
   ticketChanged,
@@ -51,11 +54,22 @@ let todaySessions = [];
 // Today's manual time entries: [{ id, start: Date, end: Date, minutes, note }].
 let manualEntries = [];
 
-// The Linear ticket being worked on ("Working on" menu). Required to Start.
+// The Linear ticket being worked on ("Working on" menu), or a note when there
+// is no ticket (type "note", see noteTask). One of the two is needed to Start.
 // { uid, id, identifier, title, url, status, project, group, pickedDay };
 // kept in the store until logout, and dropped the next day once no session
 // is running. ticketList is the last list loaded from the portal.
 let selectedTicket = null;
+// "No ticket? Write a note": the note box is shown instead of the ticket
+// field. noteDraft is what's typed. A note becomes the task only when the
+// person confirms it: "Add note" (or Enter), "Save" after "Edit", or picking
+// it from "Today's notes" in the menu. Typing alone never changes the task.
+let noteMode = false;
+let noteDraft = "";
+let noteEditing = false; // "Edit" was clicked on the current note
+let noteAdding = false; // "New note" was clicked while a note is the task
+// Today's notes on this computer ({ uid, day, notes }, see rememberNote).
+let todayNotes = { uid: null, day: null, notes: [] };
 let ticketList = { uid: null, tickets: [], fetchedAtMs: null };
 let ticketsLoading = false;
 let ticketsError = null;
@@ -171,9 +185,32 @@ const diagnostics = document.getElementById("diagnostics");
 const diagnosticsText = document.getElementById("diagnostics-text");
 const openLogBtn = document.getElementById("open-log-btn");
 const picker = createTicketPicker({
-  onPick: (ticket) => void pickTicket(ticket),
+  // A row of "Today's notes" goes back to that note.
+  onPick: (ticket) => void (isNote(ticket) ? pickNote(ticket.title) : pickTicket(ticket)),
   onReload: () => void loadTickets({ force: true }),
   onOpen: () => void loadTickets(),
+  onNoteMode: (on) => setNoteMode(on),
+  onNoteInput: (text) => {
+    noteDraft = text;
+    renderTicketPicker();
+  },
+  onNoteSubmit: (text) => void pickNote(text),
+  onNoteEdit: () => {
+    if (!isNote(selectedTicket)) return;
+    noteEditing = true;
+    noteDraft = selectedTicket.title;
+    renderTicketPicker();
+    picker.focusNote?.();
+  },
+  // "New note": an empty box for another note; the current one stays the
+  // task until the new one is added.
+  onNoteNew: () => openNewNote(),
+  onNoteCancel: () => {
+    noteEditing = false;
+    noteAdding = false;
+    noteDraft = "";
+    renderTicketPicker();
+  },
 });
 let updateIsReadyToInstall = false;
 let permissionCheckInProgress = false;
@@ -296,13 +333,28 @@ function resetStuckButtons() {
   } catch (_) {}
 }
 
-// ─── Working on: the Linear ticket ──────────────────────────────────────────
-// Start needs a ticket; without one the button opens the menu.
+// ─── Working on: the Linear ticket, or a note ───────────────────────────────
+// Start needs a ticket, or an added note in note mode; without one the button
+// opens the menu (or goes to the note box).
+const canStartWith = () => (noteMode ? isNote(selectedTicket) : !!selectedTicket);
+
 function resetStartButton() {
   startBtn.disabled = false;
-  startBtn.textContent = selectedTicket
+  startBtn.textContent = canStartWith()
     ? "▶ Start Session"
-    : "Choose a ticket to start";
+    : noteMode
+      ? "Add a note to start"
+      : "Choose a ticket to start";
+}
+
+// Today's notes for the menu (newest first), as pickable rows.
+function notesForMenu() {
+  if (!currentUser || todayNotes.uid !== currentUser.uid || todayNotes.day !== dayKey(Date.now())) {
+    return [];
+  }
+  return todayNotes.notes
+    .map((n) => noteTask(n.title, currentUser.uid, Date.now()))
+    .filter(Boolean);
 }
 
 function renderTicketPicker() {
@@ -312,8 +364,74 @@ function renderTicketPicker() {
     fetchedAtMs: ticketList.fetchedAtMs,
     loading: ticketsLoading,
     error: ticketsError,
-    required: !selectedTicket && !currentSessionId,
+    required: !canStartWith() && !currentSessionId,
+    noteMode,
+    noteText: noteDraft,
+    noteEditing,
+    noteAdding,
+    notes: notesForMenu(),
   });
+}
+
+// The header link: "No ticket? Write a note" / "Pick a ticket instead".
+// Switching back to tickets keeps a note that is already the task until a
+// ticket is picked.
+function setNoteMode(on) {
+  noteMode = !!on;
+  noteEditing = false;
+  noteAdding = false;
+  noteDraft = "";
+  renderTicketPicker();
+  if (!currentSessionId && !startBtn.disabled) resetStartButton();
+  // A note that is already the task shows as a locked field; else the box.
+  if (noteMode && !isNote(selectedTicket)) picker.focusNote?.();
+}
+
+function openNewNote() {
+  noteMode = true;
+  noteEditing = false;
+  noteAdding = isNote(selectedTicket); // else the empty box shows anyway
+  noteDraft = "";
+  renderTicketPicker();
+  if (!currentSessionId && !startBtn.disabled) resetStartButton();
+  picker.focusNote?.();
+}
+
+// Makes a confirmed note the task ("Add note", "Save", or a row of today's
+// notes). Blank or too long: nothing happens. The same text as the current
+// note: nothing is written. Running: the open block ends and a new one starts
+// on the note, one write, like a ticket switch.
+async function pickNote(text) {
+  if (!currentUser) return false;
+  const note = noteTask(text, currentUser.uid, Date.now());
+  if (!note) {
+    renderTicketPicker();
+    return false;
+  }
+  noteMode = true;
+  noteEditing = false;
+  noteAdding = false;
+  noteDraft = "";
+  todayNotes = rememberNote(todayNotes, note, currentUser.uid, note.pickedDay);
+  void window.tracker.storeSet("todayNotes", todayNotes);
+  if (
+    selectedTicket?.id === note.id &&
+    selectedTicket.title === note.title &&
+    selectedTicket.pickedDay === note.pickedDay
+  ) {
+    renderTicketPicker();
+    if (!currentSessionId && !startBtn.disabled) resetStartButton();
+    return true;
+  }
+  selectedTicket = note;
+  await saveSelectedTicket();
+  renderTicketPicker();
+  if (!currentSessionId) {
+    if (!startBtn.disabled) resetStartButton();
+    return true;
+  }
+  await syncSessionTask();
+  return true;
 }
 
 function saveSelectedTicket() {
@@ -345,6 +463,9 @@ async function pickTicket(ticket) {
     pickedDay: dayKey(Date.now()),
   };
   selectedTicket = next;
+  noteMode = false; // a ticket ends note mode
+  noteEditing = false;
+  noteAdding = false;
   await saveSelectedTicket();
   renderTicketPicker();
   if (!currentSessionId) {
@@ -427,7 +548,7 @@ async function loadTickets({ force = false } = {}) {
 // A reload shows the picked ticket's newest title and status: the running
 // session's snapshot follows, so the portal shows the status it had that day.
 async function followSelectedTicket() {
-  if (!selectedTicket) return;
+  if (!selectedTicket || isNote(selectedTicket)) return;
   const latest = ticketList.tickets.find((t) => t.id === selectedTicket.id);
   if (!latest || !ticketChanged(selectedTicket, latest)) return;
   selectedTicket = { ...selectedTicket, ...latest };
@@ -464,17 +585,91 @@ async function restoreTicketState(uid) {
     (hasSession || saved.pickedDay === dayKey(Date.now()))
       ? saved
       : null;
+  noteMode = isNote(selectedTicket);
+  noteDraft = "";
+  noteEditing = false;
+  noteAdding = false;
+  const notes = await window.tracker.storeGet("todayNotes");
+  todayNotes =
+    notes?.uid === uid && notes?.day === dayKey(Date.now()) && Array.isArray(notes.notes)
+      ? notes
+      : { uid, day: dayKey(Date.now()), notes: [] };
   renderTicketPicker();
 }
 
 function forgetTickets() {
   selectedTicket = null;
+  noteMode = false;
+  noteDraft = "";
+  noteEditing = false;
+  noteAdding = false;
+  todayNotes = { uid: null, day: null, notes: [] };
   ticketList = { uid: null, tickets: [], fetchedAtMs: null };
   ticketsError = null;
   ticketsLoading = false;
   picker.close();
   renderTicketPicker();
 }
+
+// ─── Tracker events ─────────────────────────────────────────────────────────
+// After a change is saved to Firebase, the tracker tells the portal
+// (timer.started, manual_time.created, manual_time.deleted), which posts it to
+// the person's Discord channel. Sent in the background with one retry; a
+// failure is only logged and never affects tracking.
+const EVENT_RETRY_MS = 30 * 1000;
+
+async function sendEventOnce(user, event) {
+  try {
+    const token =
+      typeof user.getIdToken === "function" ? await user.getIdToken() : "";
+    return await window.tracker.sendTrackerEvent(token, event);
+  } catch (err) {
+    return { ok: false, code: "offline", message: err?.message || "" };
+  }
+}
+
+function sendTrackerEvent(event, onSent) {
+  const user = currentUser;
+  if (!user || typeof window.tracker.sendTrackerEvent !== "function") return;
+  void (async () => {
+    let res = await sendEventOnce(user, event);
+    if (!res?.ok && res?.status !== 400) {
+      await new Promise((r) => setTimeout(r, EVENT_RETRY_MS));
+      if (currentUser?.uid !== user.uid) return; // signed out meanwhile
+      res = await sendEventOnce(user, event);
+    }
+    if (res?.ok) onSent?.(res);
+    else {
+      void window.tracker.logEvent?.(
+        "tracker-event",
+        `${event.type} not sent: ${res?.status || ""} ${res?.code || ""} ${res?.message || ""}`,
+      );
+    }
+  })();
+}
+
+// Start button: "has started work" is posted for the first start of the
+// Pakistan-time day only. The day is remembered once the portal has it, so a
+// failed send is tried again on the next Start that day.
+async function sendTimerStarted() {
+  const uid = currentUser?.uid;
+  if (!uid) return;
+  const day = getPkDateString();
+  const last = await window.tracker.storeGet("workStartedDay").catch(() => null);
+  const firstOfDay = !(last && last.uid === uid && last.day === day);
+  sendTrackerEvent({ type: "timer.started", firstOfDay }, () => {
+    if (firstOfDay && currentUser?.uid === uid) {
+      void window.tracker.storeSet("workStartedDay", { uid, day });
+    }
+  });
+}
+
+const manualTimeEvent = (type, entry) => ({
+  type,
+  minutes: Math.max(1, Math.round(entry.minutes)),
+  note: entry.note || "",
+  date: getPkDateString(entry.start),
+});
 
 window.addEventListener("unhandledrejection", (event) => {
   const msg = event?.reason?.message || String(event?.reason || "unknown");
@@ -802,6 +997,7 @@ logoutBtn.addEventListener("click", async () => {
     await window.tracker.storeSet("pendingSessionEndAtMs", null);
     await window.tracker.storeSet("selectedTicket", null);
     await window.tracker.storeSet("linearTickets", null);
+    await window.tracker.storeSet("todayNotes", null);
   } catch (err) {
     console.error("Failed to clear session state on logout:", err);
   }
@@ -823,7 +1019,12 @@ logoutBtn.addEventListener("click", async () => {
 
 startBtn.addEventListener("click", async () => {
   if (currentSessionId) return;
-  // A ticket is required, picked today (yesterday's pick isn't carried over).
+  // In note mode an added note is needed; typed but not added: the note box.
+  if (noteMode && !isNote(selectedTicket)) {
+    picker.focusNote?.();
+    return;
+  }
+  // A ticket (or note) is required, picked today (yesterday's isn't carried over).
   if (!selectedTicket || selectedTicket.pickedDay !== dayKey(Date.now())) {
     if (selectedTicket) {
       selectedTicket = null;
@@ -911,6 +1112,7 @@ startBtn.addEventListener("click", async () => {
     startIdlePoll();
     renderTodayTotalTime();
     setActiveUI();
+    void sendTimerStarted();
   } catch (err) {
     console.error("Failed to start session:", err);
     const friendly = err?.message || "check the console.";
@@ -2436,10 +2638,9 @@ async function submitManualEntry(event) {
   try {
     const date = getPkDateString(start);
     const id = await addManualTime(currentUser.uid, { date, start, end, note });
-    manualEntries = [
-      ...manualEntries,
-      { id, start, end, minutes: Math.round((end - start) / 60000), note },
-    ].sort((a, b) => a.start - b.start);
+    const added = { id, start, end, minutes: Math.round((end - start) / 60000), note };
+    manualEntries = [...manualEntries, added].sort((a, b) => a.start - b.start);
+    sendTrackerEvent(manualTimeEvent("manual_time.created", added));
     closeManualDialog();
     renderManualTime();
     renderTodayTotalTime();
@@ -2459,6 +2660,7 @@ async function removeManualEntry(entry) {
   try {
     await deleteManualTime(entry.id);
     manualEntries = manualEntries.filter((x) => x.id !== entry.id);
+    sendTrackerEvent(manualTimeEvent("manual_time.deleted", entry));
     renderManualTime();
     renderTodayTotalTime();
     showToast("Manual time deleted.");

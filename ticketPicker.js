@@ -1,7 +1,10 @@
-// The "Working on" field and its ticket menu (markup in index.html).
-// renderer.js owns the data and passes it in with update(); this file only
-// draws it and reports clicks. Rows are built with textContent, never HTML.
+// The "Working on" field and its ticket menu (markup in index.html), and the
+// note box used when there is no ticket. renderer.js owns the data (including
+// note mode and the typed note) and passes it in with update(); this file only
+// draws it and reports clicks and typing. Text is set with textContent / value,
+// never HTML.
 import {
+  cleanNote,
   groupTickets,
   syncedText,
   ticketErrorText,
@@ -30,7 +33,17 @@ function span(className, text) {
   return el;
 }
 
-export function createTicketPicker({ onPick, onReload, onOpen }) {
+export function createTicketPicker({
+  onPick,
+  onReload,
+  onOpen,
+  onNoteMode,
+  onNoteInput,
+  onNoteSubmit,
+  onNoteEdit,
+  onNoteNew,
+  onNoteCancel,
+}) {
   const el = (id) => document.getElementById(id);
   const field = el("ticket-field");
   const fieldDot = el("ticket-dot");
@@ -45,6 +58,18 @@ export function createTicketPicker({ onPick, onReload, onOpen }) {
   const retryBtn = el("ticket-retry");
   const list = el("ticket-list");
   const synced = el("ticket-synced");
+  const bar = field.closest(".ticket-bar");
+  const noteToggle = el("ticket-note-toggle");
+  const noteBox = el("ticket-note");
+  const noteInput = el("ticket-note-input");
+  const noteFromMenu = el("ticket-note-from-menu");
+  const noteCurrent = el("ticket-note-current");
+  const noteCurrentTitle = el("ticket-note-current-title");
+  const noteEdit = el("ticket-note-edit");
+  const noteNew = el("ticket-note-new");
+  const noteForm = el("ticket-note-form");
+  const noteSubmit = el("ticket-note-submit");
+  const noteCancel = el("ticket-note-cancel");
 
   let state = {
     tickets: [],
@@ -53,14 +78,57 @@ export function createTicketPicker({ onPick, onReload, onOpen }) {
     loading: false,
     error: null,
     required: false, // highlight the field: Start needs a ticket
+    noteMode: false, // the note box is shown instead of the ticket field
+    noteText: "", // what's typed in it
+    noteEditing: false, // "Edit" on the added note: Save / Cancel
+    noteAdding: false, // "New note" while a note is the task: Add note / Cancel
+    notes: [], // today's notes, shown first in the menu
   };
   let isOpen = false;
   let query = "";
   let tick = null;
 
+  function renderNote() {
+    bar.hidden = state.noteMode;
+    noteBox.hidden = !state.noteMode;
+    noteToggle.textContent = state.noteMode
+      ? "Pick a ticket instead"
+      : "No ticket? Write a note";
+    // An added note is locked; "Edit" opens it with Save / Cancel.
+    const current = state.selected?.type === "note" ? state.selected : null;
+    const locked = state.noteMode && !!current && !state.noteEditing && !state.noteAdding;
+    noteCurrent.hidden = !locked;
+    noteForm.hidden = locked;
+    if (current) noteCurrentTitle.textContent = current.title;
+    noteSubmit.textContent = state.noteEditing ? "Save" : "Add note";
+    noteSubmit.disabled = !cleanNote(state.noteText);
+    noteCancel.hidden = !(state.noteEditing || state.noteAdding);
+    // Don't move the caret while the person is typing (a cleared draft always clears).
+    if (
+      noteInput.value !== state.noteText &&
+      (document.activeElement !== noteInput || state.noteText === "")
+    ) {
+      noteInput.value = state.noteText;
+    }
+  }
+
   function renderField() {
+    renderNote();
     const t = state.selected;
     field.classList.toggle("needs-ticket", !t && state.required);
+    fieldMeta.classList.toggle("is-note", t?.type === "note");
+    if (t?.type === "note") {
+      // A note is the task, but tickets are shown: say so in the field.
+      fieldDot.hidden = true;
+      fieldMeta.textContent = "Note";
+      fieldMeta.hidden = false;
+      fieldTitle.textContent = t.title;
+      fieldTitle.classList.remove("placeholder");
+      field.setAttribute("aria-label", `Working on a note: ${t.title}. Choose a ticket`);
+      reloadBtn.classList.toggle("spinning", state.loading);
+      reloadBtn.disabled = state.loading;
+      return;
+    }
     field.setAttribute("aria-expanded", isOpen ? "true" : "false");
     if (t) {
       fieldDot.style.background = t.status?.color || "#a1a1aa";
@@ -113,7 +181,7 @@ export function createTicketPicker({ onPick, onReload, onOpen }) {
     renderSynced();
 
     list.replaceChildren();
-    const groups = groupTickets(state.tickets, query);
+    const groups = groupTickets([...(state.notes || []), ...state.tickets], query);
     for (const group of groups) {
       list.appendChild(span("ticket-group", group.name));
       for (const t of group.items) {
@@ -124,18 +192,23 @@ export function createTicketPicker({ onPick, onReload, onOpen }) {
         row.setAttribute("role", "option");
         row.setAttribute("aria-selected", on ? "true" : "false");
         row.dataset.id = t.id;
+        const isNote = t.type === "note";
         const dot = span("ticket-dot");
-        dot.style.background = t.status?.color || "#a1a1aa";
+        dot.style.background = isNote ? "#34d399" : t.status?.color || "#a1a1aa";
         const text = span("ticket-row-text");
         text.appendChild(span("ticket-row-title", t.title));
         const meta = span("ticket-row-meta");
-        meta.appendChild(span("ticket-id", t.identifier));
-        const extra = [t.status?.name, t.project?.name].filter(Boolean).join(" · ");
-        if (extra) meta.appendChild(document.createTextNode(` · ${extra}`));
+        if (isNote) {
+          meta.appendChild(span("ticket-note-tag", "Note"));
+        } else {
+          meta.appendChild(span("ticket-id", t.identifier));
+          const extra = [t.status?.name, t.project?.name].filter(Boolean).join(" · ");
+          if (extra) meta.appendChild(document.createTextNode(` · ${extra}`));
+        }
         text.appendChild(meta);
         row.append(dot, text);
         if (on) row.appendChild(checkIcon());
-        row.title = `${t.identifier} · ${t.title}`;
+        row.title = isNote ? `Note · ${t.title}` : `${t.identifier} · ${t.title}`;
         row.addEventListener("click", () => {
           close();
           onPick(t);
@@ -188,6 +261,31 @@ export function createTicketPicker({ onPick, onReload, onOpen }) {
   const options = () => [...list.querySelectorAll(".ticket-row")];
 
   field.addEventListener("click", () => (isOpen ? close() : open()));
+  noteToggle.addEventListener("click", () => {
+    close();
+    onNoteMode?.(!state.noteMode);
+  });
+  // From the menu: always an empty box for a new note.
+  noteFromMenu.addEventListener("click", () => {
+    close();
+    onNoteNew?.();
+  });
+  noteInput.addEventListener("input", () => onNoteInput?.(noteInput.value));
+  // A note is only used once confirmed: "Add note" / "Save" or Enter. Leaving
+  // the box changes nothing. Esc cancels an edit.
+  noteInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      if (cleanNote(noteInput.value)) onNoteSubmit?.(noteInput.value);
+    } else if (e.key === "Escape" && (state.noteEditing || state.noteAdding)) {
+      e.preventDefault();
+      onNoteCancel?.();
+    }
+  });
+  noteSubmit.addEventListener("click", () => onNoteSubmit?.(noteInput.value));
+  noteCancel.addEventListener("click", () => onNoteCancel?.());
+  noteEdit.addEventListener("click", () => onNoteEdit?.());
+  noteNew.addEventListener("click", () => onNoteNew?.());
   backdrop.addEventListener("click", close);
   reloadBtn.addEventListener("click", () => onReload());
   retryBtn.addEventListener("click", () => onReload());
@@ -231,5 +329,8 @@ export function createTicketPicker({ onPick, onReload, onOpen }) {
     },
     open,
     close,
+    focusNote() {
+      noteInput.focus();
+    },
   };
 }

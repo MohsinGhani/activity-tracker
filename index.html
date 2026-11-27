@@ -86,10 +86,14 @@
         <p id="status-text" class="status-text">No active session</p>
       </div>
 
-      <!-- Working on: the Linear ticket this time goes to (ticketPicker.js) -->
+      <!-- Working on: the Linear ticket this time goes to, or a note when there
+           is no ticket (ticketPicker.js) -->
       <section id="ticket-section" class="ticket-section" aria-label="Working on">
         <div class="ticket-head">
           <span class="ticket-label">Working on</span>
+          <button id="ticket-note-toggle" class="ticket-note-toggle" type="button">
+            No ticket? Write a note
+          </button>
         </div>
         <div class="ticket-bar">
           <button
@@ -123,6 +127,46 @@
             </svg>
           </button>
         </div>
+        <div id="ticket-note" class="ticket-note" hidden>
+          <!-- The added note: locked until "Edit" -->
+          <div id="ticket-note-current" class="ticket-note-current" hidden>
+            <span class="ticket-field-text">
+              <span class="ticket-field-meta is-note">Note</span>
+              <span id="ticket-note-current-title" class="ticket-field-title"></span>
+            </span>
+            <button id="ticket-note-new" class="ticket-note-edit" type="button" aria-label="Write a new note">
+              <svg viewBox="0 0 20 20" width="14" height="14" aria-hidden="true">
+                <path d="M10 4v12M4 10h12" />
+              </svg>
+              New note
+            </button>
+            <button id="ticket-note-edit" class="ticket-note-edit" type="button" aria-label="Edit the note">
+              <svg viewBox="0 0 20 20" width="14" height="14" aria-hidden="true">
+                <path d="M13.5 3.5l3 3L7 16H4v-3z" />
+              </svg>
+              Edit
+            </button>
+          </div>
+          <!-- Writing a new note, or editing the added one -->
+          <div id="ticket-note-form" class="ticket-note-form">
+            <label for="ticket-note-input" class="visually-hidden">What are you working on?</label>
+            <input
+              id="ticket-note-input"
+              class="ticket-note-input"
+              type="text"
+              maxlength="120"
+              placeholder="What are you working on? e.g. Client call prep"
+              autocomplete="off"
+              spellcheck="true"
+              aria-describedby="ticket-note-help"
+            />
+            <button id="ticket-note-cancel" class="ticket-note-cancel" type="button" hidden>Cancel</button>
+            <button id="ticket-note-submit" class="ticket-note-submit" type="button" disabled>Add note</button>
+          </div>
+          <span id="ticket-note-help" class="ticket-note-help"
+            >Notes show in the portal as time without a ticket. Pick a ticket when there is one.</span
+          >
+        </div>
         <div id="ticket-backdrop" class="ticket-backdrop" hidden></div>
         <div id="ticket-menu" class="ticket-menu" role="listbox" aria-label="Linear tickets" hidden>
           <label class="ticket-search">
@@ -145,6 +189,9 @@
           <div id="ticket-list" class="ticket-list"></div>
           <div class="ticket-menu-foot">
             <span id="ticket-synced"></span>
+            <button id="ticket-note-from-menu" class="ticket-note-from-menu" type="button">
+              No ticket? Write a note
+            </button>
           </div>
         </div>
       </section>

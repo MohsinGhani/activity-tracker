@@ -47,8 +47,8 @@ export async function getTodaySessionsSummary() { return { totalEndedSeconds: 0,
 export const TRACKER_SETTINGS_DEFAULTS = Object.freeze({ manualTimeAllowed: false, screenshotIntervalMin: 10, idleThresholdMin: 15 });
 export function watchTrackerSettings(userId, onChange) { onChange({ ...TRACKER_SETTINGS_DEFAULTS, ...(fb().settings || {}) }); return () => {}; }
 export async function getManualTimeForDay() { return []; }
-export async function addManualTime() { return "m1"; }
-export async function deleteManualTime() {}
+export async function addManualTime() { if (fb().failManual) throw new Error("offline"); return "m" + ++fb().n; }
+export async function deleteManualTime() { if (fb().failManual) throw new Error("offline"); }
 export async function saveSessionSegments(id, segments) { if (fb().sessions[id]) fb().sessions[id].segments = segments; }
 export async function saveSessionHeartbeat(id, segments) {
   (fb().beats ||= []).push({ id, at: Date.now() });
@@ -68,6 +68,7 @@ export function createTicketPicker(opts) {
     update(state) { globalThis.__fb.pickerState = state; },
     open() { globalThis.__fb.pickerOpened = (globalThis.__fb.pickerOpened || 0) + 1; },
     close() {},
+    focusNote() { globalThis.__fb.noteFocused = (globalThis.__fb.noteFocused || 0) + 1; },
   };
 }
 `);
@@ -90,6 +91,20 @@ const TICKETS = [
   ticket("iss-215", "INC-215", "Attendance export to CSV", "Todo", "unstarted", "upNext"),
 ];
 const pick = async (t) => { fb.picker.onPick(t); await flush(30); };
+// The note box: switch to it, type, "Add note" (or "Save"), "Edit", "Cancel".
+const noteMode = async (on = true) => { fb.picker.onNoteMode(on); await flush(30); };
+const typeNote = async (text) => { fb.picker.onNoteInput(text); await flush(5); };
+const addNote = async (text) => { fb.picker.onNoteInput(text); fb.picker.onNoteSubmit(text); await flush(30); };
+const editNote = async () => { fb.picker.onNoteEdit(); await flush(5); };
+const cancelNote = async () => { fb.picker.onNoteCancel(); await flush(5); };
+const newNote = async () => { fb.picker.onNoteNew(); await flush(5); };
+// A row of "Today's notes" in the menu.
+const pickNote = async (title) => {
+  const row = (fb.pickerState.notes || []).find((n) => n.title === title);
+  assert.ok(row, `"${title}" is in today's notes`);
+  fb.picker.onPick(row);
+  await flush(30);
+};
 let launches = 0;
 let fb;
 
@@ -98,7 +113,8 @@ function fakeElement() {
     handlers: {}, style: {}, textContent: "", innerHTML: "", value: "", disabled: false, hidden: false,
     classList: { add() {}, remove() {}, toggle() {}, contains: () => false },
     addEventListener(type, fn) { this.handlers[type] = fn; },
-    appendChild() {}, remove() {},
+    appendChild() {}, remove() {}, append() {}, replaceChildren() {}, setAttribute() {},
+    reset() {}, focus() {},
     // Enough of a canvas for a screenshot to be "encoded".
     getContext: () => ({ drawImage() {} }),
     toBlob: (cb) => cb({ size: 1 }),
@@ -112,11 +128,12 @@ async function launch(atMs) {
   const els = {};
   globalThis.document = {
     getElementById: (id) => (els[id] ??= fakeElement()),
-    createElement: () => fakeElement(),
+    createElement: () => { const e = fakeElement(); (fb.created ||= []).push(e); return e; },
   };
   const listeners = {};
   globalThis.window = {
     addEventListener() {},
+    confirm: () => true,
     tracker: {
       platform: "win32",
       storeGet: async (k) => fb.store.get(k) ?? null,
@@ -132,6 +149,10 @@ async function launch(atMs) {
       getLinearTickets: async (token) => {
         (fb.ticketCalls ||= []).push(token);
         return fb.linear || { ok: true, tickets: TICKETS };
+      },
+      sendTrackerEvent: async (token, event) => {
+        (fb.events ||= []).push({ token, ...event, at: Date.now() });
+        return fb.eventReply ? fb.eventReply(event) : { ok: true, sent: true };
       },
       showNotification: async () => {},
       logEvent: async () => {},
@@ -652,4 +673,283 @@ test("M: logout forgets the pick and the saved list", async () => {
   assert.equal(fb.store.get("selectedTicket"), undefined);
   assert.equal(fb.store.get("linearTickets"), undefined);
   assert.ok(fb.store.get("deviceId"), "the computer's id stays");
+});
+
+// ─── N: events to the portal (Discord alerts) ──────────────────────────────
+const pkDay = (ms) => new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Karachi", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date(ms));
+const events = () => (fb.events || []).map(({ at: _at, token: _t, ...e }) => e);
+
+test("N: only the first Start of the day says 'started work'; End then Start again doesn't; the next day does", async () => {
+  reset();
+  fb.lastInputMs = at(22, 9);
+  let app = await launch(at(22, 9));
+  await app.click("start-btn");
+  assert.deepEqual(events(), [{ type: "timer.started", firstOfDay: true }]);
+  assert.equal(fb.events[0].token, "id-token-u1", "sent with the person's login");
+  assert.deepEqual(fb.store.get("workStartedDay"), { uid: "u1", day: pkDay(at(22, 9)) });
+
+  await advance(10 * MIN, { working: true });
+  await app.click("end-btn");
+  await app.click("start-btn");
+  assert.deepEqual(events().map((e) => e.firstOfDay), [true, false]);
+
+  await app.click("end-btn");
+  app = await launch(at(22, 15)); // reopened the same afternoon
+  await app.click("start-btn");
+  assert.deepEqual(events().map((e) => e.firstOfDay), [true, false, false]);
+
+  await app.click("end-btn");
+  app = await launch(at(23, 9)); // next morning
+  await app.click("start-btn");
+  assert.deepEqual(events().map((e) => e.firstOfDay), [true, false, false, true]);
+});
+
+test("N: pause, resume, idle, the midnight restart and a restart while running send nothing", async () => {
+  reset();
+  fb.lastInputMs = at(15, 20);
+  const app = await launch(at(15, 20));
+  await app.click("start-btn");
+  await advance(10 * MIN, { working: true });
+  await app.click("stop-btn"); // pause
+  await advance(5 * MIN, { working: false });
+  await app.click("stop-btn"); // resume
+  await advance(30 * MIN, { working: false }); // goes idle
+  await advance(4 * H, { working: true }); // past midnight: the session restarts at 00:00
+  assert.equal(sessions().length, 2, "a new session at midnight");
+  await launch(Date.now()); // the app restarts with the session running
+  await flush(50);
+  assert.deepEqual(events(), [{ type: "timer.started", firstOfDay: true }]);
+});
+
+test("N: a failed send is tried once more after 30 s and never stops the work; the next Start tries again", async () => {
+  reset();
+  fb.eventReply = () => ({ ok: false, code: "offline" });
+  fb.lastInputMs = at(22, 9);
+  const app = await launch(at(22, 9));
+  await app.click("start-btn");
+  assert.equal(sessions()[0].status, "active", "tracking started anyway");
+  assert.equal(fb.events.length, 1);
+  await advance(31e3, { working: true });
+  assert.equal(fb.events.length, 2, "one retry");
+  await advance(5 * MIN, { working: true });
+  assert.equal(fb.events.length, 2, "no more retries");
+  assert.equal(fb.store.get("workStartedDay"), undefined, "the day isn't marked as told");
+
+  fb.eventReply = null; // the portal is back
+  await app.click("end-btn");
+  await app.click("start-btn");
+  assert.deepEqual(events().at(-1), { type: "timer.started", firstOfDay: true });
+  assert.ok(fb.store.get("workStartedDay"));
+
+  // A refused event (400) isn't retried.
+  fb.eventReply = () => ({ ok: false, status: 400, code: "error" });
+  await app.click("end-btn");
+  await app.click("start-btn");
+  const count = fb.events.length;
+  await advance(31e3, { working: true });
+  assert.equal(fb.events.length, count);
+});
+
+test("N: manual time added and deleted send its minutes and note, only after the save worked", async () => {
+  reset();
+  fb.settings = { manualTimeAllowed: true };
+  fb.lastInputMs = at(22, 15);
+  const app = await launch(at(22, 15));
+  const form = app.els["manual-form"];
+  const fill = (from, to, note) => {
+    app.els["manual-from"].value = from;
+    app.els["manual-to"].value = to;
+    app.els["manual-note"].value = note;
+  };
+  const submit = async () => { await form.handlers.submit({ preventDefault() {} }); await flush(30); };
+
+  fill("13:00", "14:15", "  meeting with Zoya ");
+  await submit();
+  const day = pkDay(at(22, 13));
+  assert.deepEqual(events(), [{ type: "manual_time.created", minutes: 75, note: "meeting with Zoya", date: day }]);
+
+  // Saving failed: nothing is sent.
+  fb.failManual = true;
+  fill("10:00", "10:30", "standup");
+  await submit();
+  assert.equal(fb.events.length, 1);
+  fb.failManual = false;
+
+  const del = fb.created.filter((e) => e.className === "manual-item-delete").at(-1);
+  del.handlers.click();
+  await flush(30);
+  assert.deepEqual(events().at(-1), { type: "manual_time.deleted", minutes: 75, note: "meeting with Zoya", date: day });
+});
+
+// ─── O: a note instead of a ticket ─────────────────────────────────────────
+
+test("O: a note is only used once added; Start then works and the session keeps it like a ticket", async () => {
+  reset();
+  fb.autoPick = false;
+  fb.lastInputMs = at(24, 9);
+  const app = await launch(at(24, 9));
+  await noteMode(true);
+  assert.equal(fb.pickerState.noteMode, true);
+  assert.equal(fb.noteFocused, 1, "the note box gets the focus");
+  assert.equal(app.els["start-btn"].textContent, "Add a note to start");
+
+  // Typed but not added: Start doesn't create it, it goes back to the box.
+  await typeNote("Client call prep");
+  assert.equal(app.els["start-btn"].textContent, "Add a note to start");
+  await app.click("start-btn");
+  assert.equal(sessions().length, 0, "nothing started from a typed-only note");
+  assert.equal(fb.noteFocused, 2);
+
+  // Blank can't be added.
+  await addNote("   ");
+  assert.equal(fb.pickerState.selected, null);
+
+  await addNote("  Client   call prep ");
+  assert.equal(fb.pickerState.selected?.type, "note");
+  assert.equal(fb.pickerState.noteText, "", "the box is cleared once added");
+  assert.equal(app.els["start-btn"].textContent, "▶ Start Session");
+  await app.click("start-btn");
+  await advance(20 * MIN, { working: true });
+
+  const [s] = sessions();
+  assert.match(s.taskId, /^note-[0-9a-f]+$/);
+  assert.deepEqual(s.tasks[s.taskId], { type: "note", title: "Client call prep", at: at(24, 9) });
+  assert.ok(s.segments.length > 0 && s.segments.every((b) => b.t === s.taskId));
+  assert.deepEqual(events(), [{ type: "timer.started", firstOfDay: true }], "Discord 'started work' as usual");
+});
+
+test("O: while running, typing changes nothing; Edit + Cancel keeps the note; Edit + Save switches", async () => {
+  reset();
+  fb.autoPick = false;
+  fb.lastInputMs = at(24, 9);
+  const app = await launch(at(24, 9));
+  await noteMode(true);
+  await addNote("Sprint planning");
+  await app.click("start-btn");
+  await advance(10 * MIN, { working: true });
+
+  await editNote();
+  assert.equal(fb.pickerState.noteEditing, true);
+  assert.equal(fb.pickerState.noteText, "Sprint planning", "Edit starts from the current note");
+  await typeNote("Sprint planning and a typo");
+  await cancelNote();
+  assert.equal(fb.pickerState.noteEditing, false);
+  assert.equal((fb.taskWrites || []).length, 0, "Cancel writes nothing");
+  assert.equal(fb.pickerState.selected.title, "Sprint planning");
+
+  await editNote();
+  await addNote("   "); // Save with a blank note: refused, still editing
+  assert.equal((fb.taskWrites || []).length, 0);
+  await addNote("x".repeat(121)); // too long: refused
+  assert.equal((fb.taskWrites || []).length, 0);
+
+  await addNote("Sprint review"); // Save
+  await advance(10 * MIN, { working: true });
+  await app.click("end-btn");
+  const [s] = sessions();
+  assert.equal(fb.taskWrites.length, 1, "one write for the switch");
+  assert.deepEqual(Object.values(s.tasks).map((t) => t.title).sort(), ["Sprint planning", "Sprint review"]);
+});
+
+test("O: two notes, then a ticket, then back to the first note from Today's notes: its time keeps adding up", async () => {
+  reset();
+  fb.autoPick = false;
+  fb.lastInputMs = at(24, 9);
+  const app = await launch(at(24, 9));
+  await noteMode(true);
+  await addNote("Interview prep");
+  await app.click("start-btn");
+  await advance(30 * MIN, { working: true }); // 09:00-09:30 note A
+  await newNote();
+  assert.equal(fb.pickerState.noteAdding, true, "New note opens an empty box");
+  assert.equal(fb.pickerState.noteText, "");
+  assert.equal(fb.pickerState.selected.title, "Interview prep", "the current note stays until the new one is added");
+  await addNote("Client call"); // 09:30-09:50 note B
+  await advance(20 * MIN, { working: true });
+  await pick(TICKETS[0]); // 09:50-10:10 ticket
+  assert.equal(fb.pickerState.noteMode, false);
+  await advance(20 * MIN, { working: true });
+
+  assert.deepEqual(fb.pickerState.notes.map((n) => n.title), ["Client call", "Interview prep"], "today's notes, newest first");
+  await pickNote("Interview prep"); // 10:10-10:25 back on note A
+  await advance(15 * MIN, { working: true });
+  await app.click("end-btn");
+
+  const [s] = sessions();
+  const id = (title) => Object.keys(s.tasks).find((k) => s.tasks[k].title === title);
+  const mins = (b) => Math.round((b.e - b.s) / MIN);
+  const on = (t) => s.segments.filter((b) => b.t === t && b.k === "a").reduce((n, b) => n + mins(b), 0);
+  assert.equal(Object.keys(s.tasks).length, 3, "note A, note B and the ticket");
+  assert.equal(on(id("Interview prep")), 45, "30 + 15 minutes on note A, one task");
+  assert.equal(on(id("Client call")), 20);
+  assert.equal(on("iss-218"), 20);
+  assert.equal(fb.taskWrites.length, 3, "one write per switch");
+});
+
+test("O: today's notes and the added note survive a restart the same day, not the next morning", async () => {
+  reset();
+  fb.autoPick = false;
+  fb.lastInputMs = at(24, 9);
+  const app = await launch(at(24, 9));
+  await noteMode(true);
+  await addNote("Team training");
+  await app.click("start-btn");
+  await advance(10 * MIN, { working: true });
+  await app.click("end-btn");
+
+  const app2 = await launch(at(24, 15));
+  assert.equal(fb.pickerState.noteMode, true);
+  assert.equal(fb.pickerState.selected?.title, "Team training");
+  assert.deepEqual(fb.pickerState.notes.map((n) => n.title), ["Team training"]);
+  assert.equal(app2.els["start-btn"].textContent, "▶ Start Session");
+
+  const app3 = await launch(at(25, 9));
+  assert.equal(fb.pickerState.noteMode, false);
+  assert.equal(fb.pickerState.selected, null);
+  assert.deepEqual(fb.pickerState.notes, [], "a new day starts with no notes");
+  assert.equal(app3.els["start-btn"].textContent, "Choose a ticket to start");
+});
+
+test("O: 'Pick a ticket instead' keeps the running note until a ticket is picked; logout forgets today's notes", async () => {
+  reset();
+  fb.autoPick = false;
+  fb.lastInputMs = at(24, 9);
+  const app = await launch(at(24, 9));
+  await noteMode(true);
+  await addNote("Client call");
+  await app.click("start-btn");
+  await advance(10 * MIN, { working: true });
+  await noteMode(false);
+  assert.equal(fb.pickerState.noteMode, false);
+  assert.equal(fb.pickerState.selected.type, "note", "still on the note");
+  assert.equal((fb.taskWrites || []).length, 0);
+  await pick(TICKETS[1]);
+  assert.equal(sessions()[0].taskId, "iss-215");
+  assert.ok(fb.store.get("todayNotes"));
+  await app.click("end-btn");
+  await app.click("logout-btn");
+  assert.equal(fb.store.get("todayNotes"), undefined);
+});
+
+test("O: New note + Cancel keeps the current note; a new note doesn't remove the first from today's notes", async () => {
+  reset();
+  fb.autoPick = false;
+  fb.lastInputMs = at(24, 9);
+  const app = await launch(at(24, 9));
+  await noteMode(true);
+  await addNote("Design review");
+  await app.click("start-btn");
+  await advance(10 * MIN, { working: true });
+  await newNote();
+  await typeNote("Something else");
+  await cancelNote();
+  assert.equal(fb.pickerState.noteAdding, false);
+  assert.equal(fb.pickerState.selected.title, "Design review");
+  assert.equal((fb.taskWrites || []).length, 0, "Cancel writes nothing");
+
+  await newNote();
+  await addNote("Code review");
+  assert.equal(sessions()[0].taskId, fb.pickerState.selected.id);
+  assert.deepEqual(fb.pickerState.notes.map((n) => n.title), ["Code review", "Design review"]);
+  assert.equal(fb.taskWrites.length, 1);
 });
